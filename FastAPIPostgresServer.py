@@ -1,5 +1,6 @@
 import os
-from typing import List, Optional
+from typing import List, Optional, Union 
+
 
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
@@ -77,6 +78,16 @@ class Study(BaseModel):
     
     class Config:
         from_attributes = True
+
+class Cluster(BaseModel):
+    is_cluster: bool = True # Add this field
+    point_count: int
+    latitude: float
+    longitude: float
+
+
+# The API will now return a list containing either Studies or Clusters
+MapResponse = List[Union[Cluster, Study]]
 
 class PaginatedStudies(BaseModel):
     """Container for a paginated list of studies."""
@@ -205,6 +216,69 @@ def get_studies(
     except ProgrammingError as e:
         print(f"An SQL error occurred: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while querying the database.")
+
+@app.get("/studies/map-data", response_model=MapResponse) # Changed endpoint name for clarity
+def get_map_data(
+    bbox: str = Query(..., description="Bounding box: min_lon,min_lat,max_lon,max_lat"),
+    zoom: int = Query(..., description="Current map zoom level."),
+    db=Depends(get_db)
+):
+    """
+    Get a list of clinical trials or clusters for a given map view.
+    """
+    try:
+        min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(','))
+        params = {'min_lon': min_lon, 'min_lat': min_lat, 'max_lon': max_lon, 'max_lat': max_lat}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid bbox format.")
+
+    # Define a zoom level at which we switch from clusters to individual points
+    CLUSTER_THRESHOLD = 12
+
+    if zoom < CLUSTER_THRESHOLD:
+        # --- STRATEGY FOR CLUSTERING (ZOOMED OUT) ---
+        # This SQL is a conceptual example. It needs to be adapted to your schema.
+        # It uses a grid-based approach to group points.
+        cluster_query = text("""
+            -- CONCEPTUAL QUERY FOR SERVER-SIDE CLUSTERING
+            -- Note: 'locations' is the table with your point geometries.
+            -- The grid precision (e.g., 4) needs to be tuned based on zoom levels.
+            WITH grid AS (
+                SELECT
+                    ST_SnapToGrid(geom, :min_lon, :min_lat, (:max_lon - :min_lon) / 10, (:max_lat - :min_lat) / 10) as grid_point,
+                    COUNT(*) as point_count
+                FROM locations
+                WHERE geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)
+                GROUP BY grid_point
+            )
+            SELECT
+                point_count,
+                ST_Y(grid_point) as latitude,
+                ST_X(grid_point) as longitude
+            FROM grid;
+        """)
+        results = db.execute(cluster_query, params).mappings().all()
+        return [Cluster(**row) for row in results]
+
+    else:
+        # --- STRATEGY FOR INDIVIDUAL POINTS (ZOOMED IN) ---
+        # This is your existing query to fetch individual studies within the bbox
+        # It has been simplified for this example.
+        point_query = text("""
+            SELECT pd.nct_number, pd.study_title, l.location_text, ST_Y(l.geom) as latitude, ST_X(l.geom) as longitude
+            FROM processed_data pd
+            JOIN study_locations sl ON pd.nct_number = sl.study_nct_number
+            JOIN locations l ON sl.location_id = l.id
+            WHERE ST_Intersects(l.geom, ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326));
+        """)
+        results = db.execute(point_query, params).mappings().all()
+        # This part requires logic to group locations by study if a study can have multiple locations
+        # For simplicity, we assume one location per study in this example response.
+        return [
+            Study(nct_number=row['nct_number'], study_title=row['study_title'], locations=[StudyLocation(**row)])
+            for row in results
+        ]
+
 
 if __name__ == "__main__":
     print("--- Starting Augmented Clinical Trials API Server ---")

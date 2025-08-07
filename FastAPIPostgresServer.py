@@ -3,6 +3,8 @@ from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -23,6 +25,14 @@ app = FastAPI(
     title="Augmented Clinical Trials API",
     description="API for querying clinical trials with text, status, and geospatial filters.",
     version="1.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1","http://127.0.0.1:3000", "http://localhost:3000", "https://yourfrontend.com"],  # Specify allowed origins
+    allow_credentials=True,  # Allow cookies and authorization headers
+    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allow all headers
 )
 
 @app.on_event("startup")
@@ -98,7 +108,7 @@ def get_studies(
     phase: Optional[str] = Query(None, description="Filter by study phase (e.g., 'PHASE1')."),
     bbox: Optional[str] = Query(None, description="Bounding box filter: min_lon,min_lat,max_lon,max_lat"),
     page: int = Query(1, ge=1, description="Page number for pagination."),
-    limit: int = Query(100, ge=1, le=500, description="Number of results per page."),
+    limit: int = Query(10, ge=1, le=500, description="Number of results per page."),
     db=Depends(get_db)
 ):
     """

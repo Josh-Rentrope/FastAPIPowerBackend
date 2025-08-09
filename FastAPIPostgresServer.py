@@ -150,15 +150,154 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None, status: Optional[st
     if q:
         where_clauses.append("(pd.study_title ILIKE :q OR pd.conditions ILIKE :q)")
         params['q'] = f"%{q}%"
-    # ... (rest of the filtering logic is unchanged)
+    if status:
+        where_clauses.append("pd.status ILIKE :status")
+        params['status'] = f"%{status}%"
+    if phase:
+        where_clauses.append("pd.phase ILIKE :phase")
+        params['phase'] = f"%{phase}%"
+    if bbox:
+        try:
+            min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(','))
+            # This clause ensures that we only consider studies that have at least one location within the bbox
+            where_clauses.append("EXISTS (SELECT 1 FROM study_locations sl_sub JOIN locations l_sub ON sl_sub.location_id = l_sub.id WHERE sl_sub.study_nct_number = pd.nct_number AND ST_Intersects(l_sub.geom, ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)))")
+            params.update({'min_lon': min_lon, 'min_lat': min_lat, 'max_lon': max_lon, 'max_lat': max_lat})
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid bbox format. Use 'min_lon,min_lat,max_lon,max_lat'.")
+
+    # --- Construct the query parts ---
+    base_query = "FROM processed_data pd"
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    try:
+        # --- 1. Get the total count of matching studies ---
+        count_query = text(f"SELECT COUNT(pd.nct_number) {base_query} {where_sql}")
+        total_count = db.execute(count_query, params).scalar_one()
+
+        if total_count == 0:
+            return {"total": 0, "page": page, "limit": limit, "data": []}
+
+        # --- 2. Get the paginated list of study NCT numbers ---
+        ids_query = text(f"""
+            SELECT pd.nct_number
+            {base_query}
+            {where_sql}
+            ORDER BY pd.last_updated_date DESC NULLS LAST
+            LIMIT :limit OFFSET :offset
+        """)
+        params.update({'limit': limit, 'offset': offset})
+        paginated_ids_result = db.execute(ids_query, params).fetchall()
+        paginated_nct_ids = [row[0] for row in paginated_ids_result]
+
+        if not paginated_nct_ids:
+            return {"total": total_count, "page": page, "limit": limit, "data": []}
+
+        # --- 3. Fetch the full details for the paginated studies and their locations ---
+        details_query = text("""
+            SELECT
+                pd.nct_number, pd.study_title, pd.study_url, pd.status, pd.conditions, pd.phase, pd.enrollment_count,
+                l.location_text,
+                ST_Y(l.geom) as latitude,
+                ST_X(l.geom) as longitude
+            FROM processed_data pd
+            LEFT JOIN study_locations sl ON pd.nct_number = sl.study_nct_number
+            LEFT JOIN locations l ON sl.location_id = l.id
+            WHERE pd.nct_number IN :nct_ids
+        """)
+        details_result = db.execute(details_query, {'nct_ids': tuple(paginated_nct_ids)}).mappings().all()
+
+        # --- 4. Structure the data for the response model ---
+        studies_dict = {}
+        for row in details_result:
+            nct_id = row['nct_number']
+            if nct_id not in studies_dict:
+                studies_dict[nct_id] = {**row, "locations": []}
+            if row['location_text']:
+                studies_dict[nct_id]['locations'].append({
+                    "location_text": row['location_text'],
+                    "latitude": row['latitude'],
+                    "longitude": row['longitude']
+                })
+        
+        # Pydantic V1 compatible validation
+        final_studies = [Study.parse_obj(study_data) for study_data in studies_dict.values()]
+        final_studies.sort(key=lambda s: paginated_nct_ids.index(s.nct_number))
+
+        return {
+            "total": total_count,
+            "page": page,
+            "limit": limit,
+            "data": final_studies
+        }
+    except ProgrammingError as e:
+        print(f"An SQL error occurred: {e}")
+        raise HTTPException(status_code=500, detail="An error occurred while querying the database.")
+    
     # NOTE: The full implementation of this endpoint is omitted for brevity but should be retained.
     return {"total": 0, "page": page, "limit": limit, "data": []} # Placeholder
 
+
+"""
+Get a list of clinical trials or clusters for a given map view.
+"""
 @main_router.get("/studies/map-data", response_model=MapResponse)
-def get_map_data(db=Depends(get_db), bbox: str = Query(...), zoom: int = Query(...)):
-    # This function's implementation remains the same
-    # NOTE: The full implementation of this endpoint is omitted for brevity but should be retained.
-    return [] # Placeholder
+def get_map_data(
+    bbox: str = Query(..., description="Bounding box: min_lon,min_lat,max_lon,max_lat"),
+    zoom: int = Query(..., description="Current map zoom level."),
+    db=Depends(get_db)
+):
+    try:
+        min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(','))
+        params = {'min_lon': min_lon, 'min_lat': min_lat, 'max_lon': max_lon, 'max_lat': max_lat}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid bbox format.")
+
+    # Define a zoom level at which we switch from clusters to individual points
+    CLUSTER_THRESHOLD = 12
+
+    if zoom < CLUSTER_THRESHOLD:
+        # --- STRATEGY FOR CLUSTERING (ZOOMED OUT) ---
+        # This SQL is a conceptual example. It needs to be adapted to your schema.
+        # It uses a grid-based approach to group points.
+        cluster_query = text("""
+            -- CONCEPTUAL QUERY FOR SERVER-SIDE CLUSTERING
+            -- Note: 'locations' is the table with your point geometries.
+            -- The grid precision (e.g., 4) needs to be tuned based on zoom levels.
+            WITH grid AS (
+                SELECT
+                    ST_SnapToGrid(geom, :min_lon, :min_lat, (:max_lon - :min_lon) / 10, (:max_lat - :min_lat) / 10) as grid_point,
+                    COUNT(*) as point_count
+                FROM locations
+                WHERE geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)
+                GROUP BY grid_point
+            )
+            SELECT
+                point_count,
+                ST_Y(grid_point) as latitude,
+                ST_X(grid_point) as longitude
+            FROM grid;
+        """)
+        results = db.execute(cluster_query, params).mappings().all()
+        return [Cluster(**row) for row in results]
+
+    else:
+        # --- STRATEGY FOR INDIVIDUAL POINTS (ZOOMED IN) ---
+        # This is your existing query to fetch individual studies within the bbox
+        # It has been simplified for this example.
+        point_query = text("""
+            SELECT pd.nct_number, pd.study_title, l.location_text, ST_Y(l.geom) as latitude, ST_X(l.geom) as longitude
+            FROM processed_data pd
+            JOIN study_locations sl ON pd.nct_number = sl.study_nct_number
+            JOIN locations l ON sl.location_id = l.id
+            WHERE ST_Intersects(l.geom, ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326));
+        """)
+        results = db.execute(point_query, params).mappings().all()
+        # This part requires logic to group locations by study if a study can have multiple locations
+        # For simplicity, we assume one location per study in this example response.
+        return [
+            Study(nct_number=row['nct_number'], study_title=row['study_title'], locations=[StudyLocation(**row)])
+            for row in results
+        ]
 
 # --- NEW: Webhook Endpoint for Clerk User Sync ---
 webhook_router = APIRouter()

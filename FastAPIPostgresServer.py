@@ -32,16 +32,7 @@ DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NA
 app = FastAPI(
     title="Augmented Clinical Trials API",
     description="API for querying clinical trials and supporting real-time chat.",
-    version="1.2.0",
-    # Add Clerk Middleware for authentication
-    # middleware=[
-    #     {
-    #         "middleware": ClerkMiddleware,
-    #         "params": {
-    #             "secret_key": CLERK_SECRET_KEY
-    #         }
-    #     }
-    # ]
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -219,8 +210,7 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None, status: Optional[st
                     "longitude": row['longitude']
                 })
         
-        # Pydantic V1 compatible validation
-        final_studies = [Study.parse_obj(study_data) for study_data in studies_dict.values()]
+        final_studies = [Study.model_validate(study_data) for study_data in studies_dict.values()]
         final_studies.sort(key=lambda s: paginated_nct_ids.index(s.nct_number))
 
         return {
@@ -232,72 +222,113 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None, status: Optional[st
     except ProgrammingError as e:
         print(f"An SQL error occurred: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while querying the database.")
-    
-    # NOTE: The full implementation of this endpoint is omitted for brevity but should be retained.
-    return {"total": 0, "page": page, "limit": limit, "data": []} # Placeholder
 
 
-"""
-Get a list of clinical trials or clusters for a given map view.
-"""
+# --- START: Updated get_map_data endpoint ---
 @main_router.get("/studies/map-data", response_model=MapResponse)
 def get_map_data(
+    db=Depends(get_db),
     bbox: str = Query(..., description="Bounding box: min_lon,min_lat,max_lon,max_lat"),
     zoom: int = Query(..., description="Current map zoom level."),
-    db=Depends(get_db)
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    phase: Optional[str] = None
 ):
     try:
         min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(','))
-        params = {'min_lon': min_lon, 'min_lat': min_lat, 'max_lon': max_lon, 'max_lat': max_lat}
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid bbox format.")
 
-    # Define a zoom level at which we switch from clusters to individual points
+    # --- 1. Build a dynamic WHERE clause and parameters for filtering ---
+    where_clauses, params = [], {}
+    # Bbox is always required for map data, applied to the locations table (aliased as 'l')
+    where_clauses.append("l.geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)")
+    params.update({'min_lon': min_lon, 'min_lat': min_lat, 'max_lon': max_lon, 'max_lat': max_lat})
+
+    # Add optional filters, applied to the processed_data table (aliased as 'pd')
+    if q:
+        where_clauses.append("(pd.study_title ILIKE :q OR pd.conditions ILIKE :q)")
+        params['q'] = f"%{q}%"
+    if status:
+        where_clauses.append("pd.status ILIKE :status")
+        params['status'] = f"%{status}%"
+    if phase:
+        where_clauses.append("pd.phase ILIKE :phase")
+        params['phase'] = f"%{phase}%"
+    
+    where_sql = f"WHERE {' AND '.join(where_clauses)}"
+
+    # --- 2. Define a zoom threshold to switch between clusters and points ---
     CLUSTER_THRESHOLD = 12
 
-    if zoom < CLUSTER_THRESHOLD:
-        # --- STRATEGY FOR CLUSTERING (ZOOMED OUT) ---
-        # This SQL is a conceptual example. It needs to be adapted to your schema.
-        # It uses a grid-based approach to group points.
-        cluster_query = text("""
-            -- CONCEPTUAL QUERY FOR SERVER-SIDE CLUSTERING
-            -- Note: 'locations' is the table with your point geometries.
-            -- The grid precision (e.g., 4) needs to be tuned based on zoom levels.
-            WITH grid AS (
+    try:
+        if zoom < CLUSTER_THRESHOLD:
+            # --- STRATEGY FOR CLUSTERING (ZOOMED OUT) ---
+            # This query first filters the studies, then groups their locations into a grid for clustering.
+            cluster_query = text(f"""
+                WITH filtered_locations AS (
+                    SELECT l.geom
+                    FROM locations l
+                    JOIN study_locations sl ON l.id = sl.location_id
+                    JOIN processed_data pd ON sl.study_nct_number = pd.nct_number
+                    {where_sql}
+                ),
+                grid AS (
+                    SELECT
+                        ST_SnapToGrid(geom, :min_lon, :min_lat, (:max_lon - :min_lon) / 10, (:max_lat - :min_lat) / 10) as grid_point,
+                        COUNT(*) as point_count
+                    FROM filtered_locations
+                    GROUP BY grid_point
+                )
                 SELECT
-                    ST_SnapToGrid(geom, :min_lon, :min_lat, (:max_lon - :min_lon) / 10, (:max_lat - :min_lat) / 10) as grid_point,
-                    COUNT(*) as point_count
-                FROM locations
-                WHERE geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)
-                GROUP BY grid_point
-            )
-            SELECT
-                point_count,
-                ST_Y(grid_point) as latitude,
-                ST_X(grid_point) as longitude
-            FROM grid;
-        """)
-        results = db.execute(cluster_query, params).mappings().all()
-        return [Cluster(**row) for row in results]
+                    point_count,
+                    ST_Y(grid_point) as latitude,
+                    ST_X(grid_point) as longitude
+                FROM grid WHERE grid_point IS NOT NULL;
+            """)
+            results = db.execute(cluster_query, params).mappings().all()
+            return [Cluster(**row) for row in results]
 
-    else:
-        # --- STRATEGY FOR INDIVIDUAL POINTS (ZOOMED IN) ---
-        # This is your existing query to fetch individual studies within the bbox
-        # It has been simplified for this example.
-        point_query = text("""
-            SELECT pd.nct_number, pd.study_title, l.location_text, ST_Y(l.geom) as latitude, ST_X(l.geom) as longitude
-            FROM processed_data pd
-            JOIN study_locations sl ON pd.nct_number = sl.study_nct_number
-            JOIN locations l ON sl.location_id = l.id
-            WHERE ST_Intersects(l.geom, ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326));
-        """)
-        results = db.execute(point_query, params).mappings().all()
-        # This part requires logic to group locations by study if a study can have multiple locations
-        # For simplicity, we assume one location per study in this example response.
-        return [
-            Study(nct_number=row['nct_number'], study_title=row['study_title'], locations=[StudyLocation(**row)])
-            for row in results
-        ]
+        else:
+            # --- STRATEGY FOR INDIVIDUAL POINTS (ZOOMED IN) ---
+            # This query fetches individual studies that match the filters and are within the bbox.
+            point_query = text(f"""
+                SELECT
+                    pd.nct_number, pd.study_title, pd.study_url,
+                    l.location_text,
+                    ST_Y(l.geom) as latitude,
+                    ST_X(l.geom) as longitude
+                FROM processed_data pd
+                JOIN study_locations sl ON pd.nct_number = sl.study_nct_number
+                JOIN locations l ON sl.location_id = l.id
+                {where_sql};
+            """)
+            results = db.execute(point_query, params).mappings().all()
+
+            # Structure the data for the response model, grouping locations by study
+            studies_dict = {}
+            for row in results:
+                nct_id = row['nct_number']
+                if nct_id not in studies_dict:
+                    studies_dict[nct_id] = {
+                        "nct_number": nct_id,
+                        "study_title": row['study_title'],
+                        "study_url": row.get('study_url', ''),
+                        "locations": []
+                    }
+                studies_dict[nct_id]['locations'].append({
+                    "location_text": row['location_text'],
+                    "latitude": row['latitude'],
+                    "longitude": row['longitude']
+                })
+            
+            # Use model_validate (Pydantic v2) or parse_obj (v1)
+            return [Study.model_validate(study_data) for study_data in studies_dict.values()]
+    except ProgrammingError as e:
+        print(f"An SQL error occurred in get_map_data: {e}")
+        raise HTTPException(status_code=500, detail="An error occurred while fetching map data.")
+# --- END: Updated get_map_data endpoint ---
+
 
 # --- NEW: Webhook Endpoint for Clerk User Sync ---
 webhook_router = APIRouter()
@@ -343,7 +374,8 @@ chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
 @chat_router.get("/conversations", response_model=List[Conversation])
 def get_user_conversations(db=Depends(get_db), auth: dict = {}): #  Depends(get_auth())):
-    user_id = auth['sub']
+    user_id = auth.get('sub')
+    if not user_id: raise HTTPException(401, "Auth required")
     query = text("""
         SELECT c.id, c.created_at, c.updated_at
         FROM conversations c
@@ -356,7 +388,8 @@ def get_user_conversations(db=Depends(get_db), auth: dict = {}): #  Depends(get_
 
 @chat_router.post("/conversations", response_model=Conversation, status_code=201)
 def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db), auth: dict = {}): #  Depends(get_auth())):
-    creator_id = auth['sub']
+    creator_id = auth.get('sub')
+    if not creator_id: raise HTTPException(401, "Auth required")
     participant_ids = list(set(req_body.participant_ids + [creator_id]))
 
     # Transaction to create conversation and add participants
@@ -375,7 +408,8 @@ def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db),
 
 @chat_router.get("/conversations/{conv_id}/messages", response_model=List[Message])
 def get_conversation_messages(conv_id: str, db=Depends(get_db), auth: dict  = {}): #  Depends(get_auth())):
-    user_id = auth['sub']
+    user_id = auth.get('sub')
+    if not user_id: raise HTTPException(401, "Auth required")
     
     # First, verify the user is a participant
     check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
@@ -393,7 +427,8 @@ def get_conversation_messages(conv_id: str, db=Depends(get_db), auth: dict  = {}
 
 @chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
 def post_message(conv_id: str, request_body: dict, db=Depends(get_db), auth: dict  = {}): #  Depends(get_auth())):
-    user_id = auth['sub']
+    user_id = auth.get('sub')
+    if not user_id: raise HTTPException(401, "Auth required")
     content = request_body.get('content')
     if not content:
         raise HTTPException(status_code=400, detail="Message content cannot be empty.")

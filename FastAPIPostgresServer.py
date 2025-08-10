@@ -458,20 +458,32 @@ def post_message(conv_id: str, request_body: dict, db=Depends(get_db), email: st
             messages_for_llm.append({"role": "user" if msg['sender_id'] == user_id else "assistant", "content": msg['content']})
 
         # 3. Send the query to the LLM
-        llm_response = llm_client.chat(model="gpt-4", messages=messages_for_llm, tools=[]) # Simplified for brevity
+
+
+        llm_response = llm_client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": "Hello!"}],
+            tools=available_tools
+        )   #.chat(model="gpt-4", messages=messages_for_llm, ) # Simplified for brevity
 
         # 4 & 5. Check if the LLM wants to use a tool
-        if llm_response.get("choices")[0].get("message").get("tool_calls"):
-            tool_call = llm_response.get("choices")[0].get("message").get("tool_calls")[0]
-            function_name = tool_call.get("function").get("name")
-            function_args = json.loads(tool_call.get("function").get("arguments"))
+        if llm_response.choices[0].message.tool_calls:
+            tool_call = llm_response.choices[0].message.tool_calls[0]
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
             
-            # Call the actual tool function
             tool_output = available_tools[function_name](db=db, **function_args)
-            print(tool_output)
-            # Send the tool output back to the LLM for a final response
-            # ... (second LLM call logic) ...
-            final_content = "Based on your request, I found the following trials: ..." # Simulated final response
+            
+            # Instead of a hardcoded string, dynamically generate the response from the tool's output.
+            studies = tool_output.get("studies", [])
+            if studies:
+                response_parts = ["I found the following trials for you:"]
+                for study in studies:
+                    response_parts.append(f"- {study['study_title']} ({study['nct_number']})")
+                final_content = "\n".join(response_parts)
+            else:
+                final_content = "I couldn't find any clinical trials matching your request. Please try a different search."
+
         else:
             final_content = llm_response.get("choices")[0].get("message").get("content")
 
@@ -522,17 +534,21 @@ openai.api_key = OPENAI_API_KEY
 # For this example, we'll mock the LLM client
 class MockOpenAI:
     def chat(self, *args, **kwargs):
-        # This mock will decide to "use a tool" if it sees the word "find"
-        user_message = kwargs["messages"][-1]["content"]
-        if "find" in user_message.lower():
+        user_message = kwargs["messages"][-1]["content"].lower()
+        # MODIFIED: Made the trigger condition smarter for better testing
+        if any(keyword in user_message for keyword in ["find", "trial", "study"]):
             # Simulate the LLM deciding to call our tool
-            tool_call_args = json.dumps({"q": user_message.replace("find", "").strip(), "limit": 3})
+            # Extracts a query by removing the keywords
+            query_text = user_message.replace("find", "").replace("trial", "").replace("study", "").strip()
+            tool_call_args = json.dumps({"q": query_text, "limit": 3})
             return {"choices": [{"message": {"tool_calls": [{"function": {"name": "search_clinical_trials", "arguments": tool_call_args}}]}}]}
         else:
             # Simulate a standard conversational response
-            return {"choices": [{"message": {"content": "I am a helpful assistant. How can I help you find clinical trials today?"}}]}
+            return {"choices": [{"message": {"content": "I can help you find information about clinical trials. What are you looking for?"}}]}
 
 llm_client = MockOpenAI() # Replace with openai.OpenAI() in production
+llm_client = openai.OpenAI() 
+
 
 # --- LLM Tool Definition ---
 def search_clinical_trials(db, q: Optional[str] = None, status: Optional[str] = None, phase: Optional[str] = None, limit: int = 3):

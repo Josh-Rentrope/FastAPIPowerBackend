@@ -11,7 +11,11 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 
 # --- Clerk and Webhook Imports ---
 from svix import Webhook, WebhookVerificationError
-#from clerk_fastapi import ClerkMiddleware, get_auth
+
+from clerk_backend_api import Clerk
+from clerk_backend_api.models.user import User
+#from clerk_backend_api.jwks_helpers import AuthenticateRequestOptions
+
 
 # --- Database Configuration ---
 # Load credentials from environment variables
@@ -25,6 +29,14 @@ DB_NAME = os.environ.get("DB_NAME", "clinical_trials")
 # It's crucial to set these in your environment for security
 CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
 CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET")
+
+if CLERK_SECRET_KEY:
+    #clerk_client = Clerk(secret_key=CLERK_SECRET_KEY)
+    clerk_client = Clerk()
+else:
+    clerk_client = None
+
+
 
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -126,6 +138,27 @@ def get_db(request: Request):
     finally:
         db.close()
 
+# --- Dependency using clerk-backend-api ---
+async def get_current_user(request: Request) -> User:
+    """
+    Dependency to authenticate a request with Clerk and return the user object.
+    Raises an HTTPException if the user is not authenticated.
+    """
+    if not clerk_client:
+        raise HTTPException(status_code=500, detail="Clerk client not configured.")
+    try:
+        # The 'authorization' header (e.g., 'Bearer <token>') is automatically extracted by the SDK
+        request_state = clerk_client.authenticate_request(request)
+        if not request_state.is_signed_in or not request_state.user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return request_state.user
+    except Exception as e:
+        # Catches potential issues with token verification (e.g., expired, invalid)
+        raise HTTPException(status_code=401, detail=f"Authentication failed: {e}")
+
+
+
+
 # --- Main API Endpoints ---
 main_router = APIRouter()
 
@@ -224,7 +257,7 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None, status: Optional[st
         raise HTTPException(status_code=500, detail="An error occurred while querying the database.")
 
 
-# --- START: Updated get_map_data endpoint ---
+
 @main_router.get("/studies/map-data", response_model=MapResponse)
 def get_map_data(
     db=Depends(get_db),
@@ -327,10 +360,11 @@ def get_map_data(
     except ProgrammingError as e:
         print(f"An SQL error occurred in get_map_data: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while fetching map data.")
-# --- END: Updated get_map_data endpoint ---
 
 
-# --- NEW: Webhook Endpoint for Clerk User Sync ---
+
+
+# --- Webhook Endpoint for Clerk User Sync ---
 webhook_router = APIRouter()
 
 @webhook_router.post("/api/webhooks/clerk-events")
@@ -369,13 +403,12 @@ async def clerk_webhook(request: Request, db=Depends(get_db)):
         
     return {"status": "success"}
 
-# --- NEW: Chat API Endpoints ---
+# --- Chat API Endpoints ---
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
 @chat_router.get("/conversations", response_model=List[Conversation])
-def get_user_conversations(db=Depends(get_db), auth: dict = {}): #  Depends(get_auth())):
-    user_id = auth.get('sub')
-    if not user_id: raise HTTPException(401, "Auth required")
+def get_user_conversations(db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
+    user_id = user.id
     query = text("""
         SELECT c.id, c.created_at, c.updated_at
         FROM conversations c
@@ -387,18 +420,15 @@ def get_user_conversations(db=Depends(get_db), auth: dict = {}): #  Depends(get_
     return results
 
 @chat_router.post("/conversations", response_model=Conversation, status_code=201)
-def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db), auth: dict = {}): #  Depends(get_auth())):
-    creator_id = auth.get('sub')
-    if not creator_id: raise HTTPException(401, "Auth required")
+def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
+    creator_id = user.id
+    # Ensure creator is always in the conversation
     participant_ids = list(set(req_body.participant_ids + [creator_id]))
 
-    # Transaction to create conversation and add participants
     with db.begin():
-        # Create conversation
         conv_query = text("INSERT INTO conversations DEFAULT VALUES RETURNING id, created_at, updated_at;")
         new_conv = db.execute(conv_query).mappings().one()
         
-        # Add participants
         part_data = [{"conv_id": new_conv['id'], "user_id": pid} for pid in participant_ids]
         part_query = text("INSERT INTO participants (conversation_id, user_id) VALUES (:conv_id, :user_id);")
         db.execute(part_query, part_data)
@@ -407,17 +437,14 @@ def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db),
 
 
 @chat_router.get("/conversations/{conv_id}/messages", response_model=List[Message])
-def get_conversation_messages(conv_id: str, db=Depends(get_db), auth: dict  = {}): #  Depends(get_auth())):
-    user_id = auth.get('sub')
-    if not user_id: raise HTTPException(401, "Auth required")
+def get_conversation_messages(conv_id: str, db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
+    user_id = user.id
     
-    # First, verify the user is a participant
     check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
     is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
     if not is_participant:
         raise HTTPException(status_code=403, detail="Not a participant of this conversation")
 
-    # Fetch messages
     msg_query = text("""
         SELECT id, conversation_id, sender_id, content, sent_at
         FROM messages WHERE conversation_id = :conv_id ORDER BY sent_at ASC;
@@ -426,14 +453,12 @@ def get_conversation_messages(conv_id: str, db=Depends(get_db), auth: dict  = {}
     return results
 
 @chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
-def post_message(conv_id: str, request_body: dict, db=Depends(get_db), auth: dict  = {}): #  Depends(get_auth())):
-    user_id = auth.get('sub')
-    if not user_id: raise HTTPException(401, "Auth required")
+def post_message(conv_id: str, request_body: dict, db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
+    user_id = user.id
     content = request_body.get('content')
     if not content:
         raise HTTPException(status_code=400, detail="Message content cannot be empty.")
 
-    # Transaction to check participation and send message
     with db.begin():
         check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
         is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
@@ -447,11 +472,42 @@ def post_message(conv_id: str, request_body: dict, db=Depends(get_db), auth: dic
         """)
         new_msg = db.execute(msg_query, {'conv_id': conv_id, 'sender_id': user_id, 'content': content}).mappings().one()
 
-        # Update the conversation's updated_at timestamp
         update_conv_query = text("UPDATE conversations SET updated_at = now() WHERE id = :conv_id;")
         db.execute(update_conv_query, {'conv_id': conv_id})
 
     return new_msg
+
+@chat_router.delete("/conversations/{conv_id}", status_code=204)
+def delete_conversation(conv_id: str, db=Depends(get_db), user: User = Depends(get_current_user)):
+    user_id = user.id
+    
+    with db.begin():
+        # Step 1: Verify the user is a participant
+        check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
+        is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
+        
+        if not is_participant:
+            raise HTTPException(status_code=403, detail="You do not have permission to delete this conversation.")
+        
+        # Step 2: Delete associated messages (assuming ON DELETE CASCADE is not set)
+        delete_messages_query = text("DELETE FROM messages WHERE conversation_id = :conv_id")
+        db.execute(delete_messages_query, {'conv_id': conv_id})
+
+        # Step 3: Delete participants
+        delete_participants_query = text("DELETE FROM participants WHERE conversation_id = :conv_id")
+        db.execute(delete_participants_query, {'conv_id': conv_id})
+
+        # Step 4: Delete the conversation itself
+        delete_conv_query = text("DELETE FROM conversations WHERE id = :conv_id")
+        result = db.execute(delete_conv_query, {'conv_id': conv_id})
+
+        if result.rowcount == 0:
+            # This case might occur in a race condition, but it's good practice to handle.
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 
 # --- Register all the routers ---
 app.include_router(main_router)

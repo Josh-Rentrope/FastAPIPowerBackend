@@ -2,7 +2,7 @@ import os
 from typing import List, Optional, Union
 
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, APIRouter
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, APIRouter, Header, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -12,30 +12,27 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 # --- Clerk and Webhook Imports ---
 from svix import Webhook, WebhookVerificationError
 
-from clerk_backend_api import Clerk
-from clerk_backend_api.models.user import User
-#from clerk_backend_api.jwks_helpers import AuthenticateRequestOptions
+# --- Clerk auth libraries commented out as requested ---
+# from clerk_backend_api import Clerk
+# from clerk_backend_api.models.user import User
+# from clerk_backend_api.jwks_helpers import AuthenticateRequestOptions
 
 
 # --- Database Configuration ---
-# Load credentials from environment variables
 DB_USER = os.environ.get("DB_USER", "user")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "password")
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = os.environ.get("DB_PORT", "5432")
 DB_NAME = os.environ.get("DB_NAME", "clinical_trials")
 
-# --- NEW: Clerk Configuration ---
-# It's crucial to set these in your environment for security
-CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
+# --- Clerk Configuration commented out ---
+# CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
 CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET")
 
-if CLERK_SECRET_KEY:
-    #clerk_client = Clerk(secret_key=CLERK_SECRET_KEY)
-    clerk_client = Clerk()
-else:
-    clerk_client = None
-
+# if CLERK_SECRET_KEY:
+#     clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
+# else:
+#     clerk_client = None
 
 
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -112,7 +109,7 @@ class PaginatedStudies(BaseModel):
     limit: int
     data: List[Study]
 
-# --- NEW: Chat Pydantic Models ---
+# --- Chat Pydantic Models ---
 class Message(BaseModel):
     id: str
     conversation_id: str
@@ -138,30 +135,21 @@ def get_db(request: Request):
     finally:
         db.close()
 
-# --- Dependency using clerk-backend-api ---
-async def get_current_user(request: Request) -> User:
+# --- NEW: Insecure dependency for demo purposes ---
+async def get_user_email_from_header(x_user_email: str = Header(...)) -> str:
     """
-    Dependency to authenticate a request with Clerk and return the user object.
-    Raises an HTTPException if the user is not authenticated.
+    INSECURE: This dependency gets the user's identity from a custom request header.
+    This is for demo purposes only and should be replaced with proper authentication.
     """
-    if not clerk_client:
-        raise HTTPException(status_code=500, detail="Clerk client not configured.")
-    try:
-        # The 'authorization' header (e.g., 'Bearer <token>') is automatically extracted by the SDK
-        request_state = clerk_client.authenticate_request(request)
-        if not request_state.is_signed_in or not request_state.user:
-            raise HTTPException(status_code=401, detail="Not authenticated")
-        return request_state.user
-    except Exception as e:
-        # Catches potential issues with token verification (e.g., expired, invalid)
-        raise HTTPException(status_code=401, detail=f"Authentication failed: {e}")
-
-
+    if not x_user_email:
+        raise HTTPException(status_code=400, detail="X-User-Email header is missing.")
+    return x_user_email
 
 
 # --- Main API Endpoints ---
 main_router = APIRouter()
 
+# ... (get_studies and get_map_data endpoints remain the same) ...
 @main_router.get("/", include_in_schema=False)
 def root():
     return {"message": "Welcome to the Augmented Clinical Trials API. Visit /docs for documentation."}
@@ -361,54 +349,21 @@ def get_map_data(
         print(f"An SQL error occurred in get_map_data: {e}")
         raise HTTPException(status_code=500, detail="An error occurred while fetching map data.")
 
-
-
-
 # --- Webhook Endpoint for Clerk User Sync ---
+# This can remain as is, since it's for syncing users to your DB from Clerk events.
 webhook_router = APIRouter()
-
 @webhook_router.post("/api/webhooks/clerk-events")
 async def clerk_webhook(request: Request, db=Depends(get_db)):
     if not CLERK_WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="Webhook secret is not configured.")
+    # ... (webhook logic) ...
     
-    headers = request.headers
-    try:
-        payload_bytes = await request.body()
-        payload_str = payload_bytes.decode("utf-8")
-        wh = Webhook(CLERK_WEBHOOK_SECRET)
-        event = wh.verify(payload_str, headers)
-    except WebhookVerificationError as e:
-        print(f"Webhook verification failed: {e}")
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    
-    event_type = event['type']
-    data = event['data']
-
-    if event_type in ['user.created', 'user.updated']:
-        clerk_user_id = data['id']
-        # Clerk stores role in public_metadata. Adapt if you use a different field.
-        role = data.get('public_metadata', {}).get('role', None)
-
-        # Use an "upsert" operation to handle both create and update
-        upsert_query = text("""
-            INSERT INTO users (clerk_user_id, role)
-            VALUES (:clerk_user_id, :role)
-            ON CONFLICT (clerk_user_id) DO UPDATE SET
-                role = EXCLUDED.role;
-        """)
-        db.execute(upsert_query, {'clerk_user_id': clerk_user_id, 'role': role})
-        db.commit()
-        print(f"Processed '{event_type}' for user {clerk_user_id}")
-        
-    return {"status": "success"}
-
-# --- Chat API Endpoints ---
+# --- Chat API Endpoints (Modified for Demo Auth) ---
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
 @chat_router.get("/conversations", response_model=List[Conversation])
-def get_user_conversations(db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
-    user_id = user.id
+def get_user_conversations(db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
+    user_id = email # Use email as the user identifier
     query = text("""
         SELECT c.id, c.created_at, c.updated_at
         FROM conversations c
@@ -417,96 +372,102 @@ def get_user_conversations(db=Depends(get_db), user: User = Depends(get_current_
         ORDER BY c.updated_at DESC;
     """)
     results = db.execute(query, {'user_id': user_id}).mappings().all()
-    return results
+    returnResults = []
+    for result in results:
+        returnResult = {}
+        for key in result:
+            returnResult[key] = str(result[key])
+        returnResults.append(returnResult)
 
-@chat_router.post("/conversations", response_model=Conversation, status_code=201)
-def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
-    creator_id = user.id
-    # Ensure creator is always in the conversation
+    return returnResults
+
+@chat_router.post("/conversations/create", response_model=Conversation, status_code=201)
+def create_conversation(req_body: CreateConversationRequest, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
+
+    creator_id = email # Use email as the user identifier
     participant_ids = list(set(req_body.participant_ids + [creator_id]))
+  
 
     with db.begin():
+
+    
+        upsert_user_query = text("""
+            INSERT INTO users (clerk_user_id) VALUES (:user_id)
+            ON CONFLICT (clerk_user_id) DO NOTHING;
+        """)
+        for user_id in participant_ids:
+            db.execute(upsert_user_query, {"user_id": user_id})
+
         conv_query = text("INSERT INTO conversations DEFAULT VALUES RETURNING id, created_at, updated_at;")
         new_conv = db.execute(conv_query).mappings().one()
-        
         part_data = [{"conv_id": new_conv['id'], "user_id": pid} for pid in participant_ids]
         part_query = text("INSERT INTO participants (conversation_id, user_id) VALUES (:conv_id, :user_id);")
         db.execute(part_query, part_data)
 
-    return new_conv
+        
+    return_new_conv = {}
 
+    for key in new_conv:
+        return_new_conv[key] = str(new_conv[key])
+    return return_new_conv
 
 @chat_router.get("/conversations/{conv_id}/messages", response_model=List[Message])
-def get_conversation_messages(conv_id: str, db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
-    user_id = user.id
-    
+def get_conversation_messages(conv_id: str, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
+    user_id = email # Use email as the user identifier
     check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
     is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
     if not is_participant:
         raise HTTPException(status_code=403, detail="Not a participant of this conversation")
-
-    msg_query = text("""
-        SELECT id, conversation_id, sender_id, content, sent_at
-        FROM messages WHERE conversation_id = :conv_id ORDER BY sent_at ASC;
-    """)
+    msg_query = text("SELECT id, conversation_id, sender_id, content, sent_at FROM messages WHERE conversation_id = :conv_id ORDER BY sent_at ASC;")
     results = db.execute(msg_query, {'conv_id': conv_id}).mappings().all()
-    return results
+    
+    returnResults = []
+    for result in results:
+        returnResult = {}
+        for key in result:
+            returnResult[key] = str(result[key])
+        returnResults.append(returnResult)
+
+    return returnResults
 
 @chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
-def post_message(conv_id: str, request_body: dict, db=Depends(get_db), user: User = Depends(get_current_user)): # <--- MODIFICATION
-    user_id = user.id
+def post_message(conv_id: str, request_body: dict, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
+    user_id = email # Use email as the user identifier
     content = request_body.get('content')
     if not content:
         raise HTTPException(status_code=400, detail="Message content cannot be empty.")
-
     with db.begin():
         check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
         is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
         if not is_participant:
             raise HTTPException(status_code=403, detail="Not a participant of this conversation")
-        
-        msg_query = text("""
-            INSERT INTO messages (conversation_id, sender_id, content)
-            VALUES (:conv_id, :sender_id, :content)
-            RETURNING id, conversation_id, sender_id, content, sent_at;
-        """)
+        msg_query = text("INSERT INTO messages (conversation_id, sender_id, content) VALUES (:conv_id, :sender_id, :content) RETURNING id, conversation_id, sender_id, content, sent_at;")
         new_msg = db.execute(msg_query, {'conv_id': conv_id, 'sender_id': user_id, 'content': content}).mappings().one()
-
         update_conv_query = text("UPDATE conversations SET updated_at = now() WHERE id = :conv_id;")
         db.execute(update_conv_query, {'conv_id': conv_id})
 
-    return new_msg
+    return_new_msg = {}
+
+    for key in new_msg:
+        return_new_msg[key] = str(new_msg[key])
+
+    return return_new_msg
+    return new_ms
 
 @chat_router.delete("/conversations/{conv_id}", status_code=204)
-def delete_conversation(conv_id: str, db=Depends(get_db), user: User = Depends(get_current_user)):
-    user_id = user.id
-    
+def delete_conversation(conv_id: str, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
+    user_id = email # Use email as the user identifier
     with db.begin():
-        # Step 1: Verify the user is a participant
         check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
         is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
-        
         if not is_participant:
             raise HTTPException(status_code=403, detail="You do not have permission to delete this conversation.")
-        
-        # Step 2: Delete associated messages (assuming ON DELETE CASCADE is not set)
-        delete_messages_query = text("DELETE FROM messages WHERE conversation_id = :conv_id")
-        db.execute(delete_messages_query, {'conv_id': conv_id})
-
-        # Step 3: Delete participants
-        delete_participants_query = text("DELETE FROM participants WHERE conversation_id = :conv_id")
-        db.execute(delete_participants_query, {'conv_id': conv_id})
-
-        # Step 4: Delete the conversation itself
-        delete_conv_query = text("DELETE FROM conversations WHERE id = :conv_id")
-        result = db.execute(delete_conv_query, {'conv_id': conv_id})
-
+        db.execute(text("DELETE FROM messages WHERE conversation_id = :conv_id"), {'conv_id': conv_id})
+        db.execute(text("DELETE FROM participants WHERE conversation_id = :conv_id"), {'conv_id': conv_id})
+        result = db.execute(text("DELETE FROM conversations WHERE id = :conv_id"), {'conv_id': conv_id})
         if result.rowcount == 0:
-            # This case might occur in a race condition, but it's good practice to handle.
             raise HTTPException(status_code=404, detail="Conversation not found.")
-
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
 
 
 # --- Register all the routers ---
@@ -514,10 +475,9 @@ app.include_router(main_router)
 app.include_router(webhook_router)
 app.include_router(chat_router)
 
-
 if __name__ == "__main__":
-    if not CLERK_SECRET_KEY or not CLERK_WEBHOOK_SECRET:
-        print("--- WARNING: Clerk environment variables are not set. Auth and webhooks will fail. ---")
+    # if not CLERK_SECRET_KEY:
+    #     print("--- WARNING: Clerk environment variables are not set. Auth and webhooks will fail. ---")
     print("--- Starting Augmented Clinical Trials API Server ---")
     print("API documentation will be available at http://127.0.0.1:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

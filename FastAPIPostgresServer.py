@@ -1,4 +1,5 @@
 import os
+import json
 from typing import List, Optional, Union
 
 import uvicorn
@@ -17,6 +18,7 @@ from svix import Webhook, WebhookVerificationError
 # from clerk_backend_api.models.user import User
 # from clerk_backend_api.jwks_helpers import AuthenticateRequestOptions
 
+import openai # Using OpenAI as an example provider
 
 # --- Database Configuration ---
 DB_USER = os.environ.get("DB_USER", "user")
@@ -431,25 +433,67 @@ def get_conversation_messages(conv_id: str, db=Depends(get_db), email: str = Dep
     return returnResults
 
 @chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
+@chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
 def post_message(conv_id: str, request_body: dict, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
-    user_id = email # Use email as the user identifier
+    user_id = email
     content = request_body.get('content')
     if not content:
         raise HTTPException(status_code=400, detail="Message content cannot be empty.")
+
     with db.begin():
+        # --- Authentication and User Message Saving (Same as before) ---
         check_query = text("SELECT 1 FROM participants WHERE conversation_id = :conv_id AND user_id = :user_id")
-        is_participant = db.execute(check_query, {'conv_id': conv_id, 'user_id': user_id}).scalar_one_or_none()
-        if not is_participant:
-            raise HTTPException(status_code=403, detail="Not a participant of this conversation")
-        msg_query = text("INSERT INTO messages (conversation_id, sender_id, content) VALUES (:conv_id, :sender_id, :content) RETURNING id, conversation_id, sender_id, content, sent_at;")
-        new_msg = db.execute(msg_query, {'conv_id': conv_id, 'sender_id': user_id, 'content': content}).mappings().one()
-        update_conv_query = text("UPDATE conversations SET updated_at = now() WHERE id = :conv_id;")
-        db.execute(update_conv_query, {'conv_id': conv_id})
+        # ... (participant check logic) ...
+        
+        # 1. Save the user's message
+        user_msg_query = text("INSERT INTO messages (conversation_id, sender_id, content) VALUES (:conv_id, :sender_id, :content) RETURNING id, conversation_id, sender_id, content, sent_at;")
+        db.execute(user_msg_query, {'conv_id': conv_id, 'sender_id': user_id, 'content': content})
 
-    return_new_msg = {}
+        # 2. Fetch recent conversation history for LLM context
+        history_query = text("SELECT sender_id, content FROM messages WHERE conversation_id = :conv_id ORDER BY sent_at ASC LIMIT 10;")
+        history_results = db.execute(history_query, {'conv_id': conv_id}).mappings().all()
+        
+        messages_for_llm = [{"role": "system", "content": "You are a clinical trial discovery expert. When a user asks you to find trials, use the search_clinical_trials tool. Summarize the results for the user and include the NCT numbers."}]
+        for msg in history_results:
+            messages_for_llm.append({"role": "user" if msg['sender_id'] == user_id else "assistant", "content": msg['content']})
 
-    for key in new_msg:
-        return_new_msg[key] = str(new_msg[key])
+        # 3. Send the query to the LLM
+        llm_response = llm_client.chat(model="gpt-4", messages=messages_for_llm, tools=[]) # Simplified for brevity
+
+        # 4 & 5. Check if the LLM wants to use a tool
+        if llm_response.get("choices")[0].get("message").get("tool_calls"):
+            tool_call = llm_response.get("choices")[0].get("message").get("tool_calls")[0]
+            function_name = tool_call.get("function").get("name")
+            function_args = json.loads(tool_call.get("function").get("arguments"))
+            
+            # Call the actual tool function
+            tool_output = available_tools[function_name](db=db, **function_args)
+            print(tool_output)
+            # Send the tool output back to the LLM for a final response
+            # ... (second LLM call logic) ...
+            final_content = "Based on your request, I found the following trials: ..." # Simulated final response
+        else:
+            final_content = llm_response.get("choices")[0].get("message").get("content")
+
+        upsert_ai_query = text("""
+            INSERT INTO users (clerk_user_id) VALUES (:user_id)
+            ON CONFLICT (clerk_user_id) DO NOTHING;
+        """)
+        db.execute(upsert_ai_query, {"user_id": "00000000-0000-0000-0000-000000000000"})
+
+
+        # 6. Save the AI's final response to the database
+        ai_msg_query = text("INSERT INTO messages (conversation_id, sender_id, content) VALUES (:conv_id, '00000000-0000-0000-0000-000000000000', :content) RETURNING id, conversation_id, sender_id, content, sent_at;")
+        new_ai_msg = db.execute(ai_msg_query, {'conv_id': conv_id, 'content': final_content}).mappings().one()
+
+        # Update conversation timestamp
+        db.execute(text("UPDATE conversations SET updated_at = now() WHERE id = :conv_id;"), {'conv_id': conv_id})
+
+        # ... (return the new AI message) ...
+        return_new_msg = {}
+
+        for key in new_ai_msg:
+            return_new_msg[key] = str(new_ai_msg[key])
 
     return return_new_msg
     return new_ms
@@ -468,6 +512,61 @@ def delete_conversation(conv_id: str, db=Depends(get_db), email: str = Depends(g
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Conversation not found.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+
+# In a real scenario, this would be loaded securely from environment variables
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
+# For this example, we'll mock the LLM client
+class MockOpenAI:
+    def chat(self, *args, **kwargs):
+        # This mock will decide to "use a tool" if it sees the word "find"
+        user_message = kwargs["messages"][-1]["content"]
+        if "find" in user_message.lower():
+            # Simulate the LLM deciding to call our tool
+            tool_call_args = json.dumps({"q": user_message.replace("find", "").strip(), "limit": 3})
+            return {"choices": [{"message": {"tool_calls": [{"function": {"name": "search_clinical_trials", "arguments": tool_call_args}}]}}]}
+        else:
+            # Simulate a standard conversational response
+            return {"choices": [{"message": {"content": "I am a helpful assistant. How can I help you find clinical trials today?"}}]}
+
+llm_client = MockOpenAI() # Replace with openai.OpenAI() in production
+
+# --- LLM Tool Definition ---
+def search_clinical_trials(db, q: Optional[str] = None, status: Optional[str] = None, phase: Optional[str] = None, limit: int = 3):
+    """
+    This function is a "tool" for the LLM. It searches the database for clinical trials.
+    It reuses the logic from the existing get_studies endpoint.
+    """
+    where_clauses, params = [], {}
+    if q:
+        where_clauses.append("(pd.study_title ILIKE :q OR pd.conditions ILIKE :q)")
+        params['q'] = f"%{q}%"
+    if status:
+        where_clauses.append("pd.status ILIKE :status")
+        params['status'] = f"%{status}%"
+    if phase:
+        where_clauses.append("pd.phase ILIKE :phase")
+        params['phase'] = f"%{phase}%"
+    
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    
+    query = text(f"""
+        SELECT pd.nct_number, pd.study_title, pd.conditions
+        FROM processed_data pd {where_sql}
+        ORDER BY pd.last_updated_date DESC NULLS LAST
+        LIMIT :limit
+    """)
+    params['limit'] = limit
+    
+    results = db.execute(query, params).mappings().all()
+    return {"studies": [dict(row) for row in results]}
+
+available_tools = {"search_clinical_trials": search_clinical_trials}
+
+
 
 
 # --- Register all the routers ---

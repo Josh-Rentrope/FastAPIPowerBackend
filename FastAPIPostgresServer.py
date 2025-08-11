@@ -20,6 +20,7 @@ from svix import Webhook, WebhookVerificationError
 
 import openai # Using OpenAI as an example provider
 
+from api.boundaries import router as boundaries_router
 from api.countydata import router as county_data_router
 
 # --- Database Configuration ---
@@ -591,6 +592,9 @@ available_tools = {"search_clinical_trials": search_clinical_trials}
 app.include_router(main_router)
 app.include_router(webhook_router)
 app.include_router(chat_router)
+
+app.include_router(boundaries_router)
+app.include_router(county_data_router)
 
 if __name__ == "__main__":
     # if not CLERK_SECRET_KEY:

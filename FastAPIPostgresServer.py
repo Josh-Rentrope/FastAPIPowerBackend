@@ -20,6 +20,8 @@ from svix import Webhook, WebhookVerificationError
 
 import openai # Using OpenAI as an example provider
 
+from api.countydata import router as county_data_router
+
 # --- Database Configuration ---
 DB_USER = os.environ.get("DB_USER", "user")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "password")

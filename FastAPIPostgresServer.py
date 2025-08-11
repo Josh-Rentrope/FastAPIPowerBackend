@@ -161,18 +161,48 @@ def root():
 
 @main_router.get("/studies", response_model=PaginatedStudies)
 def get_studies(db=Depends(get_db), q: Optional[str] = None, status: Optional[str] = None, phase: Optional[str] = None, bbox: Optional[str] = None, page: int = 1, limit: int = 10):
-    # This function's implementation remains the same
     offset = (page - 1) * limit
     where_clauses, params = [], {}
     if q:
         where_clauses.append("(pd.study_title ILIKE :q OR pd.conditions ILIKE :q)")
         params['q'] = f"%{q}%"
+
+    # --- FIX: Handle status filtering with exact DB values ---
     if status:
-        where_clauses.append("pd.status ILIKE :status")
-        params['status'] = f"%{status}%"
+        frontend_keys = [s.strip() for s in status.split(',')]
+        
+        # Map frontend keys to the exact database status strings
+        status_map = {
+            'RECRUITING': ['RECRUITING'],
+            'NOT_YET_RECRUITING': ['NOT_YET_RECRUITING'],
+            'COMPLETED': ['COMPLETED']
+        }
+        
+        db_status_values = []
+        for key in frontend_keys:
+            if key in status_map:
+                db_status_values.extend(status_map[key])
+        
+        if db_status_values:
+            params['status'] = list(set(db_status_values))
+            where_clauses.append("pd.status = ANY(:status)")
+
+    # --- FIX: Handle phase filtering for single and multi-phase ('|') entries ---
     if phase:
-        where_clauses.append("pd.phase ILIKE :phase")
-        params['phase'] = f"%{phase}%"
+        # Frontend sends 'PHASE_1', 'PHASE_2' -> transform to 'PHASE1', 'PHASE2'
+        phase_keys = [p.strip().replace('_', '') for p in phase.split(',')]
+        
+        if phase_keys:
+            # Build an OR clause of ILIKE statements to find matching phases
+            phase_or_clauses = []
+            for i, p_key in enumerate(phase_keys):
+                param_name = f"phase_{i}"
+                phase_or_clauses.append(f"pd.phase ILIKE :{param_name}")
+                params[param_name] = f"%{p_key}%"
+            
+            if phase_or_clauses:
+                where_clauses.append(f"({' OR '.join(phase_or_clauses)})")
+
     if bbox:
         try:
             min_lon, min_lat, max_lon, max_lat = map(float, bbox.split(','))
@@ -436,7 +466,6 @@ def get_conversation_messages(conv_id: str, db=Depends(get_db), email: str = Dep
     return returnResults
 
 @chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
-@chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
 def post_message(conv_id: str, request_body: dict, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):
     user_id = email
     content = request_body.get('content')
@@ -466,7 +495,6 @@ def post_message(conv_id: str, request_body: dict, db=Depends(get_db), email: st
         llm_response = llm_client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": "Hello!"}],
-            tools=available_tools
         )   #.chat(model="gpt-4", messages=messages_for_llm, ) # Simplified for brevity
 
         # 4 & 5. Check if the LLM wants to use a tool
@@ -511,7 +539,7 @@ def post_message(conv_id: str, request_body: dict, db=Depends(get_db), email: st
             return_new_msg[key] = str(new_ai_msg[key])
 
     return return_new_msg
-    return new_ms
+
 
 @chat_router.delete("/conversations/{conv_id}", status_code=204)
 def delete_conversation(conv_id: str, db=Depends(get_db), email: str = Depends(get_user_email_from_header)):

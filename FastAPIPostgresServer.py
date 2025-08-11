@@ -297,21 +297,44 @@ def get_map_data(
 
     # --- 1. Build a dynamic WHERE clause and parameters for filtering ---
     where_clauses, params = [], {}
-    # Bbox is always required for map data, applied to the locations table (aliased as 'l')
+    # Bbox is always required for map data
     where_clauses.append("l.geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)")
     params.update({'min_lon': min_lon, 'min_lat': min_lat, 'max_lon': max_lon, 'max_lat': max_lat})
 
-    # Add optional filters, applied to the processed_data table (aliased as 'pd')
+    # Add optional text search filter
     if q:
         where_clauses.append("(pd.study_title ILIKE :q OR pd.conditions ILIKE :q)")
         params['q'] = f"%{q}%"
-    if status:
-        where_clauses.append("pd.status ILIKE :status")
-        params['status'] = f"%{status}%"
-    if phase:
-        where_clauses.append("pd.phase ILIKE :phase")
-        params['phase'] = f"%{phase}%"
     
+    # --- FIX: Handle status filtering with exact DB values ---
+    if status:
+        frontend_keys = [s.strip() for s in status.split(',')]
+        status_map = {
+            'RECRUITING': ['RECRUITING'],
+            'NOT_YET_RECRUITING': ['NOT_YET_RECRUITING'],
+            'COMPLETED': ['COMPLETED']
+        }
+        db_status_values = []
+        for key in frontend_keys:
+            if key in status_map:
+                db_status_values.extend(status_map[key])
+        if db_status_values:
+            params['status'] = list(set(db_status_values))
+            where_clauses.append("pd.status = ANY(:status)")
+
+    # --- FIX: Handle phase filtering for single and multi-phase ('|') entries ---
+    if phase:
+        phase_keys = [p.strip().replace('_', '') for p in phase.split(',')]
+        if phase_keys:
+            phase_or_clauses = []
+            for i, p_key in enumerate(phase_keys):
+                param_name = f"phase_{i}"
+                phase_or_clauses.append(f"pd.phase ILIKE :{param_name}")
+                params[param_name] = f"%{p_key}%"
+            if phase_or_clauses:
+                where_clauses.append(f"({' OR '.join(phase_or_clauses)})")
+    
+    # The final WHERE clause to be used in the queries below
     where_sql = f"WHERE {' AND '.join(where_clauses)}"
 
     # --- 2. Define a zoom threshold to switch between clusters and points ---
@@ -320,7 +343,6 @@ def get_map_data(
     try:
         if zoom < CLUSTER_THRESHOLD:
             # --- STRATEGY FOR CLUSTERING (ZOOMED OUT) ---
-            # This query first filters the studies, then groups their locations into a grid for clustering.
             cluster_query = text(f"""
                 WITH filtered_locations AS (
                     SELECT l.geom
@@ -347,7 +369,6 @@ def get_map_data(
 
         else:
             # --- STRATEGY FOR INDIVIDUAL POINTS (ZOOMED IN) ---
-            # This query fetches individual studies that match the filters and are within the bbox.
             point_query = text(f"""
                 SELECT
                     pd.nct_number, pd.study_title, pd.study_url,
@@ -361,7 +382,7 @@ def get_map_data(
             """)
             results = db.execute(point_query, params).mappings().all()
 
-            # Structure the data for the response model, grouping locations by study
+            # Structure the data for the response model
             studies_dict = {}
             for row in results:
                 nct_id = row['nct_number']
@@ -378,7 +399,6 @@ def get_map_data(
                     "longitude": row['longitude']
                 })
             
-            # Use model_validate (Pydantic v2) or parse_obj (v1)
             return [Study.model_validate(study_data) for study_data in studies_dict.values()]
     except ProgrammingError as e:
         print(f"An SQL error occurred in get_map_data: {e}")

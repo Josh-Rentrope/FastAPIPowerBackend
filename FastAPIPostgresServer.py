@@ -66,6 +66,8 @@ from typing import List, Optional, Union
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -99,6 +101,19 @@ LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL") or os.environ.get("LLM_BASE_URL
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
 ENABLE_CHAT = os.environ.get("ENABLE_CHAT", "1") == "1"
 
+# ── map clustering ──────────────────────────────────────────────────────────
+#
+# Cells across the viewport at zoom 3, doubling per level above that, capped so a
+# dense viewport cannot return tens of thousands of markers. Above
+# CLUSTER_ZOOM_THRESHOLD the map switches to individual points and clusters on
+# the client instead.
+#
+# These are environment variables rather than constants because "how much detail"
+# is a taste question that should be tunable without a code change.
+CLUSTER_GRID_BASE = int(os.environ.get("CLUSTER_GRID_BASE", "64"))
+CLUSTER_GRID_MAX = int(os.environ.get("CLUSTER_GRID_MAX", "1024"))
+CLUSTER_THRESHOLD = int(os.environ.get("CLUSTER_ZOOM_THRESHOLD", "12"))
+
 DATABASE_URL = (
     f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
@@ -118,6 +133,48 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
+
+
+class EnsureCorsOnError(BaseHTTPMiddleware):
+    """Put CORS headers on unhandled 500s.
+
+    Starlette installs its `ServerErrorMiddleware` outside every user middleware,
+    so an exception that escapes a route produces a response with no
+    `Access-Control-Allow-Origin` at all -- and a browser can only report that as
+    "blocked by CORS policy". The real fault is a server error, and this makes the
+    response say so, with the headers the browser needs in order to show it.
+
+    Added AFTER CORSMiddleware, because `add_middleware` puts each new layer on
+    the outside; this one has to be outside CORS to catch what CORS cannot.
+    """
+
+    def __init__(self, app, origins: list[str]) -> None:
+        super().__init__(app)
+        self.origins = set(origins)
+
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:  # noqa: BLE001
+            origin = request.headers.get("origin")
+            headers = {}
+            if origin and origin in self.origins:
+                headers["Access-Control-Allow-Origin"] = origin
+                headers["Access-Control-Allow-Credentials"] = "true"
+                headers["Vary"] = "Origin"
+            # Logged, because the point of this middleware is that the failure is
+            # otherwise invisible from the client side.
+            print(f"UNHANDLED {request.method} {request.url.path}: "
+                  f"{type(exc).__name__}: {exc}")
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "internal server error",
+                         "error": type(exc).__name__},
+                headers=headers,
+            )
+
+
+app.add_middleware(EnsureCorsOnError, origins=CORS_ORIGINS)
 
 
 @app.on_event("startup")
@@ -427,18 +484,30 @@ def get_map_data(db=Depends(get_db),
     clauses.append("l.geom IS NOT NULL")
     where = "WHERE " + " AND ".join(clauses)
 
-    CLUSTER_THRESHOLD = 12
-
     if zoom < CLUSTER_THRESHOLD:
-        # Cell size comes from the viewport so the grid is ~64 cells across at any
-        # zoom, rather than from the zoom level directly. ST_SnapToGrid returns the
-        # cell's lower-left corner, so the result is translated by half a cell --
-        # otherwise every cluster renders half a cell away from the points it
-        # represents. The original passed five arguments here, which PostGIS reads
-        # as (geom, size_x, size_y, size_z, size_m) and which collapsed every
-        # point into one cluster.
-        sx = (max_lon - min_lon) / 64.0
-        sy = (max_lat - min_lat) / 64.0
+        # ── grid resolution ──────────────────────────────────────────────────
+        #
+        # Cells across the viewport double per zoom level instead of staying at a
+        # fixed 64. A fixed grid meant zooming in only re-stamped the same lattice
+        # over a smaller area, so the map appeared to stop revealing structure --
+        # the opposite of what zooming is for. Doubling keeps the detail growing
+        # with the zoom and makes the last few levels before the point threshold
+        # essentially one cell per location.
+        #
+        # The cap is the payload: every cluster becomes a marker in the browser,
+        # and the densest viewport holds ~50k locations. Raise CLUSTER_GRID_MAX if
+        # the client can take more, lower it if the map feels sluggish.
+        cells = min(CLUSTER_GRID_MAX, CLUSTER_GRID_BASE * (2 ** max(0, zoom - 3)))
+        sx = (max_lon - min_lon) / cells
+        sy = (max_lat - min_lat) / cells
+
+        # ST_SnapToGrid returns the cell's lower-left corner, so the result is
+        # translated by half a cell -- otherwise every cluster renders half a cell
+        # away from the points it represents. The original passed five arguments
+        # here, which PostGIS reads as (geom, size_x, size_y, size_z, size_m) and
+        # which collapsed every point into one cluster.
+        lat_expr = "ST_Y(ST_Translate(ST_SnapToGrid(l.geom, :sx, :sy), :sx / 2.0, :sy / 2.0))"
+        lon_expr = "ST_X(ST_Translate(ST_SnapToGrid(l.geom, :sx, :sy), :sx / 2.0, :sy / 2.0))"
 
         # ── why the join is conditional ──────────────────────────────────────
         #
@@ -448,33 +517,76 @@ def get_map_data(db=Depends(get_db),
         # gives up on the index and sequentially scans all 3.4M rows of
         # study_locations, measured at 933 ms. Dropping the join when there is
         # nothing to filter on makes the same request index-only against
-        # locations.geom.
-        #
-        # The count also changes meaning slightly, deliberately: it becomes the
-        # number of distinct locations rather than the number of study-location
-        # pairs. For a density map the former is the more honest quantity -- a
-        # study running five sites in one city is five sites, not one.
-        if not filtered:
-            rows = db.execute(text("""
-                SELECT count(*) AS point_count,
-                       ST_Y(ST_Translate(ST_SnapToGrid(l.geom, :sx, :sy), :sx / 2.0, :sy / 2.0)) AS latitude,
-                       ST_X(ST_Translate(ST_SnapToGrid(l.geom, :sx, :sy), :sx / 2.0, :sy / 2.0)) AS longitude
-                FROM locations l
-                {where}
-                GROUP BY 2, 3
-            """.replace("{where}", where)), {**params, "sx": sx, "sy": sy}).mappings().all()
-        else:
-            rows = db.execute(text("""
-                SELECT count(*) AS point_count,
-                       ST_Y(ST_Translate(ST_SnapToGrid(l.geom, :sx, :sy), :sx / 2.0, :sy / 2.0)) AS latitude,
-                       ST_X(ST_Translate(ST_SnapToGrid(l.geom, :sx, :sy), :sx / 2.0, :sy / 2.0)) AS longitude
+        # locations.geom, measured at 106 ms.
+        join_sql = (
+            "JOIN study_locations sl ON sl.location_id = l.id "
+            "JOIN processed_data pd ON pd.nct_number = sl.study_nct_number"
+            if filtered else ""
+        )
+
+        rows = db.execute(text(f"""
+            SELECT count(*) AS point_count,
+                   {lat_expr} AS latitude,
+                   {lon_expr} AS longitude,
+                   (array_agg(l.id))[1] AS sample_location_id
+            FROM locations l
+            {join_sql}
+            {where}
+            GROUP BY 2, 3
+        """), {**params, "sx": sx, "sy": sy}).mappings().all()
+
+        # A cell holding exactly one location is not a cluster -- it is a pin, and
+        # returning it as a cluster meant a circle with a "1" in it, which is both
+        # ugly and unclickable in any useful way. Those cells are resolved to the
+        # trial behind them, so the client can render a real marker and open a
+        # popup for it.
+        singletons = [r["sample_location_id"] for r in rows
+                      if r["point_count"] == 1 and r["sample_location_id"] is not None]
+        by_location: dict[int, dict] = {}
+        if singletons:
+            detail = db.execute(text("""
+                SELECT l.id AS location_id, l.location_text,
+                       ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
+                       l.geocode_precision,
+                       pd.nct_number, pd.study_title, pd.study_url, pd.acronym,
+                       pd.status, pd.conditions, pd.phase, pd.sponsor,
+                       pd.enrollment_count
                 FROM locations l
                 JOIN study_locations sl ON sl.location_id = l.id
                 JOIN processed_data pd ON pd.nct_number = sl.study_nct_number
-                {where}
-                GROUP BY 2, 3
-            """.replace("{where}", where)), {**params, "sx": sx, "sy": sy}).mappings().all()
-        return [Cluster(**r) for r in rows]
+                WHERE l.id = ANY(:ids)
+                ORDER BY pd.last_updated_date DESC NULLS LAST
+            """), {"ids": singletons}).mappings().all()
+            for d in detail:
+                # Most recent study at that site wins; a location can host several.
+                by_location.setdefault(d["location_id"], dict(d))
+
+        out: list = []
+        for r in rows:
+            if r["point_count"] == 1:
+                d = by_location.get(r["sample_location_id"])
+                if d:
+                    out.append(Study.model_validate({
+                        "nct_number": d["nct_number"],
+                        "study_title": d["study_title"],
+                        "study_url": d["study_url"],
+                        "acronym": d["acronym"],
+                        "status": d["status"],
+                        "conditions": d["conditions"],
+                        "phase": d["phase"],
+                        "sponsor": d["sponsor"],
+                        "enrollment_count": d["enrollment_count"],
+                        "locations": [{
+                            "location_text": d["location_text"],
+                            "latitude": d["latitude"],
+                            "longitude": d["longitude"],
+                            "precision": d["geocode_precision"],
+                        }],
+                    }))
+                    continue
+            out.append(Cluster(**{k: r[k] for k in
+                                  ("point_count", "latitude", "longitude")}))
+        return out
 
     rows = db.execute(text(f"""
         SELECT pd.nct_number, pd.study_title, pd.study_url, pd.acronym, pd.status,
@@ -668,15 +780,24 @@ def post_message(conv_id: str, body: dict, request: Request, db=Depends(get_db))
     if not _owns(db, conv_id, session["id"]):
         raise HTTPException(404, "conversation not found")
 
-    with db.begin():
-        db.execute(text("""
-            INSERT INTO messages (conversation_id, sender_id, content)
-            VALUES (:c, :s, :m)
-        """), {"c": conv_id, "s": session["id"], "m": content})
-        history = db.execute(text("""
-            SELECT sender_id, content FROM messages
-            WHERE conversation_id = :c ORDER BY sent_at DESC, id DESC LIMIT 10
-        """), {"c": conv_id}).mappings().all()
+    # Explicit commits rather than `with db.begin():`.
+    #
+    # `_run_llm` runs SELECTs through this same Session, and SQLAlchemy
+    # autobegins a transaction on the first execute. A subsequent `db.begin()`
+    # then raises "A transaction is already begun on this Session" -- which
+    # escaped as an unhandled 500, which Starlette turned into a response with
+    # no CORS headers, which the browser reported as a CORS failure. The real
+    # error was never CORS.
+    db.execute(text("""
+        INSERT INTO messages (conversation_id, sender_id, content)
+        VALUES (:c, :s, :m)
+    """), {"c": conv_id, "s": session["id"], "m": content})
+    db.commit()
+
+    history = db.execute(text("""
+        SELECT sender_id, content FROM messages
+        WHERE conversation_id = :c ORDER BY sent_at DESC, id DESC LIMIT 10
+    """), {"c": conv_id}).mappings().all()
 
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in reversed(history):
@@ -687,14 +808,17 @@ def post_message(conv_id: str, body: dict, request: Request, db=Depends(get_db))
 
     reply = _run_llm(db, msgs)
 
-    with db.begin():
-        row = db.execute(text("""
-            INSERT INTO messages (conversation_id, sender_id, content)
-            VALUES (:c, :s, :m)
-            RETURNING id, conversation_id, sender_id, content, sent_at
-        """), {"c": conv_id, "s": sessions_mod.AI_SENDER_ID, "m": reply}).mappings().one()
-        db.execute(text("UPDATE conversations SET updated_at = now() WHERE id = :c"),
-                   {"c": conv_id})
+    # Close whatever transaction the tool queries left open before writing.
+    db.commit()
+
+    row = db.execute(text("""
+        INSERT INTO messages (conversation_id, sender_id, content)
+        VALUES (:c, :s, :m)
+        RETURNING id, conversation_id, sender_id, content, sent_at
+    """), {"c": conv_id, "s": sessions_mod.AI_SENDER_ID, "m": reply}).mappings().one()
+    db.execute(text("UPDATE conversations SET updated_at = now() WHERE id = :c"),
+               {"c": conv_id})
+    db.commit()
 
     return {k: str(v) for k, v in row.items()}
 
@@ -723,28 +847,50 @@ def _run_llm(db, msgs: list[dict]) -> str:
     except Exception as exc:  # noqa: BLE001
         return f"The model is unreachable right now ({type(exc).__name__})."
 
+    # An empty `choices` list is legal in some OpenAI-compatible implementations
+    # and would be an IndexError otherwise.
+    if not getattr(first, "choices", None):
+        return "The model returned no answer."
+
     choice = first.choices[0].message
     calls = getattr(choice, "tool_calls", None)
     if not calls:
         return choice.content or "No answer was produced."
 
     msgs.append(choice)
+
+    # The tool signature is fixed, but the model chooses the argument names. A
+    # key that is not in the signature raises TypeError, which used to escape as
+    # a 500 -- so arguments are filtered rather than splatted blindly.
+    allowed = {"q", "status", "phase", "limit"}
+
     for call in calls:
         if call.function.name != "search_clinical_trials":
             msgs.append({"role": "tool", "tool_call_id": call.id,
                          "name": call.function.name, "content": "{}"})
             continue
         try:
-            args = json.loads(call.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        result = _search_trials(db, **args)
+            raw_args = json.loads(call.function.arguments or "{}")
+        except (json.JSONDecodeError, TypeError):
+            raw_args = {}
+        if not isinstance(raw_args, dict):
+            raw_args = {}
+        args = {k: v for k, v in raw_args.items() if k in allowed}
+        try:
+            result = _search_trials(db, **args)
+        except Exception as exc:  # noqa: BLE001
+            # A failed query should become a tool result the model can explain,
+            # not an exception that takes down the request.
+            db.rollback()
+            result = {"error": f"search failed: {type(exc).__name__}"}
         msgs.append({"role": "tool", "tool_call_id": call.id,
                      "name": call.function.name,
                      "content": json.dumps(result, default=str)})
 
     try:
         second = client.chat.completions.create(model=CHAT_MODEL, messages=msgs)
+        if not getattr(second, "choices", None):
+            return "The model returned no answer."
         return second.choices[0].message.content or "No answer was produced."
     except Exception as exc:  # noqa: BLE001
         return f"The model is unreachable right now ({type(exc).__name__})."

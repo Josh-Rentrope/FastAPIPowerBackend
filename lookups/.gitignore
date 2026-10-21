@@ -1,0 +1,11 @@
+# Downloaded reference data belongs to the machine, not the repository.
+#
+# This directory holds ~286 MB of GeoNames, Census and CHR&R files. All of it is
+# reproducible from lookups/00_fetch_reference_data.py, none of it is small, and
+# a `git add .` without this file would have committed the lot.
+#
+# The scripts stay tracked; everything else is ignored.
+
+*
+!.gitignore
+!*.py

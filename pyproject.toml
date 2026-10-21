@@ -1,0 +1,25 @@
+[project]
+name = "clinical-trials-pipeline"
+version = "1.0.0"
+description = "ETL, geocoding and API for the ClinicalTrials.gov demo platform"
+requires-python = ">=3.11"
+
+# The API itself is deployed from requirements.txt (App Platform reads that);
+# this file is for the local ETL and is resolved with `uv run`.
+dependencies = [
+    "psycopg2-binary>=2.9.9",
+    # Shapefiles are read with pyshp rather than geopandas. TIGER county files are
+    # plain polygons and we only need WKT out, so a ~200 KB pure-Python reader beats
+    # pulling the whole GDAL stack onto a Windows dev box.
+    "pyshp>=2.3.1",
+    "pycountry>=24.6.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.30",
+    "pydantic>=2.7.0",
+    "openai>=1.40.0",
+    # svix was only needed for the Clerk webhook, which the session rewrite removes.
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]

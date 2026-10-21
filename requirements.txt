@@ -1,0 +1,13 @@
+# Runtime dependencies for the API image.
+#
+# `openai` is the client for any OpenAI-compatible endpoint, not specifically
+# OpenAI -- OPENAI_BASE_URL can point it at DeepSeek or a local Ollama.
+#
+# psycopg2-binary rather than psycopg2: the binary wheel bundles libpq, so the
+# image does not need postgresql-dev and a compiler at build time.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+sqlalchemy>=2.0,<3.0
+psycopg2-binary>=2.9.9
+pydantic>=2.7,<3.0
+openai>=1.40

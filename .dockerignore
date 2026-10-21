@@ -1,0 +1,31 @@
+# The reference data is ~125 MB (an 84 MB TIGER shapefile, 40 MB of GeoNames
+# cities) and belongs to the ETL, not the API. Without this the image grows by
+# more than an order of magnitude for files the server never opens.
+lookups/*.zip
+lookups/*.shp
+lookups/*.shx
+lookups/*.dbf
+lookups/*.prj
+lookups/*.txt
+lookups/*.csv
+lookups/*.xml
+
+# ETL and development
+etl/
+db/
+__pycache__/
+*.pyc
+.venv/
+uv.lock
+
+# Original scripts, superseded but kept in the repo for reference
+CSVDataIngestion.py
+S3IngestionOrchestrator.py
+PostGresDatabaseSetup.py
+PostGresTableInspector.py
+CHRNRSetup.py
+
+.git/
+.gitignore
+TableSchema.md
+README.md

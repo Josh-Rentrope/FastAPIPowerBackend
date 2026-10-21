@@ -142,8 +142,13 @@ change:
 | `CLUSTER_GRID_MAX` | 1024 | Ceiling on cells, i.e. on marker count at high zoom. |
 | `CLUSTER_ZOOM_THRESHOLD` | 12 | Zoom at which the client takes over clustering. |
 
-A cell containing exactly one location is returned as the trial itself rather than
-a cluster of one, so it renders as a pin with a popup.
+A cell containing exactly one location is returned as a point rather than a
+cluster of one, so it renders as a pin with a popup. When that one location hosts
+several studies it is returned as a **site** — `is_site: true`, the true
+`point_count`, and the five most recent `trials` — because locations dedupe at city
+level and a single point can stand for a large research hub. Houston, for instance,
+is one location carrying over 15,000 studies; returning one arbitrary study told
+the user a city held one trial.
 
 ## Eligibility screening
 

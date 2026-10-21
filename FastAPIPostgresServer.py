@@ -277,7 +277,22 @@ class Cluster(BaseModel):
     longitude: float
 
 
-MapResponse = List[Union[Cluster, Study]]
+class Site(BaseModel):
+    """One geocoded location hosting several studies.
+
+    Locations dedupe at city level, so a single point can represent a large
+    research hub -- Houston alone carries over 15,000 studies. Returning it as one
+    arbitrary Study told the user a city held one trial. This carries the count
+    and a short, most-recent-first list, which is what a popup can actually show.
+    """
+    is_site: bool = True
+    point_count: int
+    latitude: float
+    longitude: float
+    trials: List[Study] = []
+
+
+MapResponse = List[Union[Cluster, Site, Study]]
 
 
 class PaginatedStudies(BaseModel):
@@ -556,47 +571,73 @@ def get_map_data(db=Depends(get_db),
         # popup for it.
         singletons = [r["sample_location_id"] for r in rows
                       if r["point_count"] == 1 and r["sample_location_id"] is not None]
-        by_location: dict[int, dict] = {}
+        by_location: dict[int, list[dict]] = {}
+        location_total: dict[int, int] = {}
         if singletons:
+            # ROW_NUMBER rather than DISTINCT ON: a site can host thousands of
+            # studies and the UI wants the five most recent, not an arbitrary one.
+            # The window count gives the true total without a second query.
             detail = db.execute(text("""
-                SELECT l.id AS location_id, l.location_text,
-                       ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
-                       l.geocode_precision,
-                       pd.nct_number, pd.study_title, pd.study_url, pd.acronym,
-                       pd.status, pd.conditions, pd.phase, pd.sponsor,
-                       pd.enrollment_count
-                FROM locations l
-                JOIN study_locations sl ON sl.location_id = l.id
-                JOIN processed_data pd ON pd.nct_number = sl.study_nct_number
-                WHERE l.id = ANY(:ids)
-                ORDER BY pd.last_updated_date DESC NULLS LAST
+                WITH ranked AS (
+                    SELECT l.id AS location_id, l.location_text,
+                           ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
+                           l.geocode_precision,
+                           pd.nct_number, pd.study_title, pd.study_url, pd.acronym,
+                           pd.status, pd.conditions, pd.phase, pd.sponsor,
+                           pd.enrollment_count,
+                           count(*) OVER (PARTITION BY l.id) AS total_at_site,
+                           row_number() OVER (PARTITION BY l.id
+                                              ORDER BY pd.last_updated_date DESC NULLS LAST,
+                                                       pd.nct_number) AS rn
+                    FROM locations l
+                    JOIN study_locations sl ON sl.location_id = l.id
+                    JOIN processed_data pd ON pd.nct_number = sl.study_nct_number
+                    WHERE l.id = ANY(:ids)
+                )
+                SELECT * FROM ranked WHERE rn <= 5
             """), {"ids": singletons}).mappings().all()
             for d in detail:
-                # Most recent study at that site wins; a location can host several.
-                by_location.setdefault(d["location_id"], dict(d))
+                by_location.setdefault(d["location_id"], []).append(dict(d))
+                location_total[d["location_id"]] = d["total_at_site"]
+
+        def as_study(d: dict) -> Study:
+            return Study.model_validate({
+                "nct_number": d["nct_number"],
+                "study_title": d["study_title"],
+                "study_url": d["study_url"],
+                "acronym": d["acronym"],
+                "status": d["status"],
+                "conditions": d["conditions"],
+                "phase": d["phase"],
+                "sponsor": d["sponsor"],
+                "enrollment_count": d["enrollment_count"],
+                "locations": [{
+                    "location_text": d["location_text"],
+                    "latitude": d["latitude"],
+                    "longitude": d["longitude"],
+                    "precision": d["geocode_precision"],
+                }],
+            })
 
         out: list = []
         for r in rows:
             if r["point_count"] == 1:
-                d = by_location.get(r["sample_location_id"])
-                if d:
-                    out.append(Study.model_validate({
-                        "nct_number": d["nct_number"],
-                        "study_title": d["study_title"],
-                        "study_url": d["study_url"],
-                        "acronym": d["acronym"],
-                        "status": d["status"],
-                        "conditions": d["conditions"],
-                        "phase": d["phase"],
-                        "sponsor": d["sponsor"],
-                        "enrollment_count": d["enrollment_count"],
-                        "locations": [{
-                            "location_text": d["location_text"],
-                            "latitude": d["latitude"],
-                            "longitude": d["longitude"],
-                            "precision": d["geocode_precision"],
-                        }],
-                    }))
+                loc_id = r["sample_location_id"]
+                found = by_location.get(loc_id) or []
+                if found:
+                    total = location_total.get(loc_id, len(found))
+                    # Coordinates come from the location itself, not the grid
+                    # cell centre, which is offset by half a cell.
+                    lat, lon = found[0]["latitude"], found[0]["longitude"]
+                    if total > 1:
+                        out.append(Site(
+                            point_count=total,
+                            latitude=lat,
+                            longitude=lon,
+                            trials=[as_study(d) for d in found],
+                        ))
+                    else:
+                        out.append(as_study(found[0]))
                     continue
             out.append(Cluster(**{k: r[k] for k in
                                   ("point_count", "latitude", "longitude")}))

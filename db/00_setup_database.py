@@ -491,10 +491,44 @@ def main() -> int:
     cur = conn.cursor()
 
     print(f"connected to {args.host}:{args.port}/{args.dbname}")
-    cur.execute("SELECT version(), postgis_full_version()")
-    pg, postgis = cur.fetchone()
-    print(f"  {pg.split(',')[0]}")
-    print(f"  {postgis.split(' ')[0]} {postgis.split(' ')[1]}")
+
+    # Report the environment; never assume it. This used to call
+    # postgis_full_version() directly, which raises
+    # "function postgis_full_version() does not exist" on a database where the
+    # extension has not been enabled -- a confusing way to say "run the enable
+    # step", and one that pointed at the script rather than at the database.
+    cur.execute("SELECT version()")
+    print(f"  {cur.fetchone()[0].split(',')[0]}")
+
+    cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+    is_super = bool(cur.fetchone()[0])
+
+    cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'postgis'")
+    row = cur.fetchone()
+    if row:
+        # postgis_full_version() returns a very long dependency dump; the version
+        # inside the quotes is the useful part.
+        cur.execute("SELECT postgis_full_version()")
+        full = cur.fetchone()[0]
+        version = full.split('"')[1] if '"' in full else full[:40]
+        print(f"  PostGIS {version}")
+    elif is_super:
+        print("  postgis not installed yet; this role can create it, proceeding.")
+    else:
+        # CREATE EXTENSION is superuser-only, and it is per DATABASE -- a cluster
+        # is created with defaultdb, so enabling it there leaves this database
+        # untouched. Say exactly that rather than failing on a geometry column.
+        print("  postgis NOT INSTALLED in this database.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  Run this first, as the cluster's admin role (doadmin):", file=sys.stderr)
+        print("      uv run python db/00_enable_postgis.py \\", file=sys.stderr)
+        print("          --user doadmin --password <admin-password>", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  CREATE EXTENSION applies per database, so enabling PostGIS in", file=sys.stderr)
+        print("  defaultdb does not make it available here.", file=sys.stderr)
+        cur.close()
+        conn.close()
+        return 2
 
     if args.drop:
         print("\n-- dropping (destructive) --")

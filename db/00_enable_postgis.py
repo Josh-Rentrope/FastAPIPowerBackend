@@ -68,15 +68,14 @@ def main() -> int:
 
     print(f"connected as {args.user} to {args.host}:{args.port}/{args.dbname}")
 
-    # Confirm we are actually a superuser, rather than failing on the first
-    # CREATE EXTENSION with a message that reads like a missing extension.
-    cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
-    is_super = cur.fetchone()[0]
-    if not is_super:
-        print(f"{args.user} is not a superuser; CREATE EXTENSION will be refused.",
-              file=sys.stderr)
-        print("Run this as doadmin (the cluster's admin role).", file=sys.stderr)
-        return 1
+    # `rolsuper` is the WRONG test on a managed cluster, and getting it wrong
+    # rejects the only role that works. DigitalOcean's doadmin is
+    # *superuser-like*: it can create trusted extensions such as PostGIS, but
+    # pg_roles.rolsuper is still false for it. So this reports the flag and then
+    # attempts the work, rather than refusing on a flag that does not mean here
+    # what it means on a self-hosted server.
+    cur.execute("SELECT rolsuper, rolname FROM pg_roles WHERE rolname = current_user")
+    is_super, who = cur.fetchone()
 
     for ext in REQUIRED:
         cur.execute("SELECT extversion FROM pg_extension WHERE extname = %s", (ext,))
@@ -89,6 +88,15 @@ def main() -> int:
                 sql.Identifier(ext)))
             cur.execute("SELECT extversion FROM pg_extension WHERE extname = %s", (ext,))
             print(f"  {ext:<10} installed ({cur.fetchone()[0]})")
+        except psycopg2.errors.InsufficientPrivilege as exc:
+            print(f"  {ext:<10} permission denied for {who}: {exc}".rstrip(),
+                  file=sys.stderr)
+            if ext == "postgis":
+                print("", file=sys.stderr)
+                print("  DigitalOcean requires a temporary superuser grant for some", file=sys.stderr)
+                print("  extensions. In the console: Databases -> this cluster ->", file=sys.stderr)
+                print("  Users -> doadmin -> Temporary superuser, then re-run this.", file=sys.stderr)
+                return 1
         except psycopg2.Error as exc:
             # pg_trgm before 13, or a cluster that genuinely lacks the package.
             print(f"  {ext:<10} FAILED: {exc}", file=sys.stderr)

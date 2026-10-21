@@ -73,8 +73,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+import qualification
 import sessions as sessions_mod
 from api.boundaries import router as boundaries_router
+from api.qualification import router as qualification_router
 
 # The correlation router declares prefix "/api/correlation" with a "/" route, so
 # only "/api/correlation/" is a real path. It is mounted at both spellings below.
@@ -110,7 +112,19 @@ ENABLE_CHAT = os.environ.get("ENABLE_CHAT", "1") == "1"
 #
 # These are environment variables rather than constants because "how much detail"
 # is a taste question that should be tunable without a code change.
-CLUSTER_GRID_BASE = int(os.environ.get("CLUSTER_GRID_BASE", "64"))
+# Cells across the viewport AT ZOOM 3, doubling per level above that. Measured
+# against the whole-US viewport (49,285 locations):
+#
+#     base   clusters at zoom 3   largest cluster
+#        4                20           11,865
+#        8                62            4,734     <- default
+#       16               206            3,367
+#       32               627            1,814
+#       64             1,687            1,506
+#
+# Lower base = fewer, larger clusters when zoomed out. At 64 the national view
+# was returning ~1,700 markers, which reads as noise rather than density.
+CLUSTER_GRID_BASE = int(os.environ.get("CLUSTER_GRID_BASE", "8"))
 CLUSTER_GRID_MAX = int(os.environ.get("CLUSTER_GRID_MAX", "1024"))
 CLUSTER_THRESHOLD = int(os.environ.get("CLUSTER_ZOOM_THRESHOLD", "12"))
 
@@ -741,33 +755,119 @@ def _search_trials(db, q=None, status=None, phase=None, limit=5):
     return {"studies": [dict(r) for r in rows]}
 
 
-TOOL_SCHEMA = [{
-    "type": "function",
-    "function": {
-        "name": "search_clinical_trials",
-        "description": "Search the clinical trials database by condition, "
-                       "recruitment status, and phase. Always use this rather "
-                       "than answering from memory.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "q": {"type": "string", "description": "Condition or keywords, e.g. 'melanoma'"},
-                "status": {"type": "string", "enum": sorted(KNOWN_STATUSES)},
-                "phase": {"type": "string",
-                          "description": "PHASE1, PHASE2, PHASE3, PHASE4, EARLY_PHASE1"},
-                "limit": {"type": "integer", "description": "Max results, default 5"},
+def _list_protocols(db):
+    """Which criteria sets the assistant can screen against."""
+    return {"criteria": qualification.list_criteria(),
+            "matcher": qualification.describe_matcher()}
+
+
+def _screen_eligibility(db, criteria_id=None, answers=None):
+    """Run one round of eligibility screening and return the next questions.
+
+    Deliberately stateless: the assistant holds the accumulated answers in the
+    conversation and passes them back each turn. That means the screening can be
+    resumed after a dropped connection, corrected when a patient changes an
+    answer, and reproduced from an exported transcript.
+    """
+    c = qualification.get_criteria(criteria_id or "")
+    if not c:
+        return {"error": f"unknown criteria_id {criteria_id!r}",
+                "available": [x["id"] for x in qualification.list_criteria()]}
+    if not isinstance(answers, dict):
+        answers = {}
+    return qualification.load_matcher().evaluate(c, answers).as_dict()
+
+
+TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_clinical_trials",
+            "description": "Search the clinical trials database by condition, "
+                           "recruitment status, and phase. Always use this rather "
+                           "than answering from memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string", "description": "Condition or keywords, e.g. 'melanoma'"},
+                    "status": {"type": "string", "enum": sorted(KNOWN_STATUSES)},
+                    "phase": {"type": "string",
+                              "description": "PHASE1, PHASE2, PHASE3, PHASE4, EARLY_PHASE1"},
+                    "limit": {"type": "integer", "description": "Max results, default 5"},
+                },
+                "required": [],
             },
-            "required": [],
         },
     },
-}]
+    {
+        "type": "function",
+        "function": {
+            "name": "list_qualification_protocols",
+            "description": "List the eligibility criteria sets that can be "
+                           "screened against conversationally.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screen_eligibility",
+            "description": (
+                "Screen a person against a protocol's inclusion/exclusion criteria. "
+                "Pass every answer collected so far; the call is stateless. It "
+                "returns a verdict (likely_eligible, ineligible, needs_info), the "
+                "criteria that blocked, and the next questions to ask. Never ask "
+                "for information it does not request, and never decide eligibility "
+                "yourself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "criteria_id": {"type": "string",
+                                    "description": "from list_qualification_protocols"},
+                    "answers": {
+                        "type": "object",
+                        "description": (
+                            "Answers collected so far, keyed by field name from the "
+                            "question objects. Booleans as true/false, numbers as "
+                            "integers, enums as their option string."
+                        ),
+                    },
+                },
+                "required": ["criteria_id"],
+            },
+        },
+    },
+]
+
+# name -> (callable, accepted argument names). The filter matters: the model picks
+# argument names, and a stray key is a TypeError that would otherwise escape as a
+# 500 -- which a browser reports as a CORS failure.
+TOOL_REGISTRY = {
+    "search_clinical_trials": (_search_trials, {"q", "status", "phase", "limit"}),
+    "list_qualification_protocols": (_list_protocols, set()),
+    "screen_eligibility": (_screen_eligibility, {"criteria_id", "answers"}),
+}
 
 SYSTEM_PROMPT = (
-    "You are a clinical trial discovery assistant. Answer only from the results "
-    "of the search_clinical_trials tool, and always call it before answering a "
-    "question about trials. Cite trials by their NCT number, verbatim. If the "
-    "tool returns nothing, say so plainly rather than offering anything from "
-    "memory -- a fabricated NCT number is worse than no answer."
+    "You are a clinical trial discovery assistant. You help people find trials and "
+    "work out whether a trial's stated criteria could apply to them.\n\n"
+    "RULES:\n"
+    "1. Answer only from tool results. Always call search_clinical_trials before "
+    "answering a question about trials, and cite trials by their NCT number "
+    "verbatim. If a tool returns nothing, say so plainly -- a fabricated NCT "
+    "number is worse than no answer.\n"
+    "2. For eligibility, call list_qualification_protocols, then ask the person "
+    "ONE question at a time from the returned `next_questions`, in order. Their "
+    "wording is already written for a patient; use it. After each answer, call "
+    "screen_eligibility again with all answers so far.\n"
+    "3. You are screening, not deciding. Never say someone is eligible or "
+    "ineligible -- say which criteria they appear to meet or not meet, and that "
+    "the study team confirms it.\n"
+    "4. Be conversational and brief. Do not dump a questionnaire. If someone "
+    "declines a question, move on; it will be reported as unknown.\n"
+    "5. This is health information, not medical advice. Encourage them to discuss "
+    "anything concerning with their care team."
 )
 
 
@@ -859,33 +959,36 @@ def _run_llm(db, msgs: list[dict]) -> str:
 
     msgs.append(choice)
 
-    # The tool signature is fixed, but the model chooses the argument names. A
-    # key that is not in the signature raises TypeError, which used to escape as
-    # a 500 -- so arguments are filtered rather than splatted blindly.
-    allowed = {"q", "status", "phase", "limit"}
-
     for call in calls:
-        if call.function.name != "search_clinical_trials":
-            msgs.append({"role": "tool", "tool_call_id": call.id,
-                         "name": call.function.name, "content": "{}"})
-            continue
+        name = call.function.name
+        # The model chooses the argument names, so they are filtered against the
+        # function's real signature. A stray key would be a TypeError, which used
+        # to escape as a 500 -- and a 500 without CORS headers reads, in a
+        # browser, as a CORS failure.
+        fn, allowed = TOOL_REGISTRY.get(name, (None, set()))
+
         try:
             raw_args = json.loads(call.function.arguments or "{}")
         except (json.JSONDecodeError, TypeError):
             raw_args = {}
         if not isinstance(raw_args, dict):
             raw_args = {}
-        args = {k: v for k, v in raw_args.items() if k in allowed}
-        try:
-            result = _search_trials(db, **args)
-        except Exception as exc:  # noqa: BLE001
-            # A failed query should become a tool result the model can explain,
-            # not an exception that takes down the request.
-            db.rollback()
-            result = {"error": f"search failed: {type(exc).__name__}"}
+
+        if fn is None:
+            result = {"error": f"unknown tool {name!r}",
+                      "available": sorted(TOOL_REGISTRY)}
+        else:
+            args = {k: v for k, v in raw_args.items() if k in allowed}
+            try:
+                result = fn(db, **args)
+            except Exception as exc:  # noqa: BLE001
+                # A failed tool should become a result the model can explain, not
+                # an exception that takes down the request.
+                db.rollback()
+                result = {"error": f"{name} failed: {type(exc).__name__}"}
+
         msgs.append({"role": "tool", "tool_call_id": call.id,
-                     "name": call.function.name,
-                     "content": json.dumps(result, default=str)})
+                     "name": name, "content": json.dumps(result, default=str)})
 
     try:
         second = client.chat.completions.create(model=CHAT_MODEL, messages=msgs)
@@ -901,6 +1004,7 @@ def _run_llm(db, msgs: list[dict]) -> str:
 app.include_router(main_router)
 app.include_router(session_router)
 app.include_router(boundaries_router)
+app.include_router(qualification_router)
 
 # Mounted at both spellings: the router declares prefix "/api/correlation" with a
 # "/" route, so only "/api/correlation/" is a real path and "/api/correlation"

@@ -1,0 +1,175 @@
+{
+  "id": "hnscc-r-m-first-line",
+  "label": "Recurrent / metastatic HNSCC, first-line systemic therapy",
+  "condition": "Head and Neck Squamous Cell Carcinoma",
+  "version": "1.0",
+  "source_note": "Encoded from a published protocol's Inclusion/Exclusion criteria. This is a SCREENING AID, not an eligibility determination: many criteria cannot be assessed by interview (PD-L1 CPS, RECIST measurability, organ function) and are marked accordingly.",
+
+  "fields": [
+    { "key": "age", "label": "Age", "type": "integer", "min": 0, "max": 120,
+      "question": "How old are you?",
+      "help": "Must be 18 or older on the day consent is signed." },
+
+    { "key": "diagnosis_confirmed", "label": "Pathology-confirmed diagnosis", "type": "boolean",
+      "question": "Has your diagnosis of head and neck squamous cell carcinoma been confirmed by a biopsy or pathology report?",
+      "help": "Histologically or cytologically confirmed." },
+
+    { "key": "primary_site", "label": "Primary tumour site", "type": "enum",
+      "options": ["oral cavity", "hypopharynx", "larynx", "oropharynx", "paranasal sinus", "nasopharynx", "other"],
+      "question": "Where is the primary tumour?",
+      "help": "Paranasal sinus and nasopharynx are excluded regardless of histology." },
+
+    { "key": "hpv_status", "label": "HPV status", "type": "enum",
+      "options": ["positive", "negative", "unknown"],
+      "question": "If the primary is in the oropharynx, do you know your HPV status?",
+      "help": "OPSCC requires documented HPV-negative disease." },
+
+    { "key": "setting", "label": "Disease setting", "type": "enum",
+      "options": ["recurrent", "metastatic", "locally advanced"],
+      "question": "Is your disease recurrent or metastatic, or is it still only locally advanced?" },
+
+    { "key": "prior_systemic_r_m", "label": "Prior systemic therapy for recurrent/metastatic disease", "type": "boolean",
+      "question": "Have you had any systemic therapy since the cancer came back or spread?",
+      "help": "This protocol requires that there has been none." },
+
+    { "key": "months_since_adjuvant", "label": "Months since systemic therapy completed (adjuvant/definitive)", "type": "integer", "min": 0, "max": 600,
+      "question": "If you had chemotherapy or other systemic therapy as part of earlier curative-intent treatment, how many months ago did it finish?",
+      "help": "Must be more than 6 months." },
+
+    { "key": "archival_tissue", "label": "Tumour tissue available", "type": "boolean",
+      "question": "Is there an archived tumour sample available, or would you be willing to have a biopsy at screening?",
+      "help": "Either archived tissue or willingness to biopsy is required." },
+
+    { "key": "measurable_disease", "label": "Measurable disease (RECIST 1.1)", "type": "boolean",
+      "question": "Has your care team said you have measurable disease?",
+      "help": "Assessed on imaging by the study team, not by interview." },
+
+    { "key": "ecog", "label": "ECOG performance status", "type": "enum", "options": ["0", "1", "2", "3", "4"],
+      "question": "Do you know your ECOG performance status? It runs from 0 (fully active) to 4 (fully disabled).",
+      "help": "Must be 0 or 1." },
+
+    { "key": "suitable_for_curative_local", "label": "Disease suitable for curative-intent local therapy", "type": "boolean",
+      "question": "Has your care team said the disease could still be treated with local therapy given with curative intent, such as surgery or radiation?",
+      "help": "If so, this protocol excludes you." },
+
+    { "key": "prior_anti_tgfb", "label": "Prior anti-TGFβ therapy", "type": "boolean",
+      "question": "Have you ever had a treatment that targets TGF-beta?" },
+
+    { "key": "prior_anti_egfr", "label": "Prior anti-EGFR antibody", "type": "boolean",
+      "question": "Have you had an antibody treatment targeting EGFR, such as cetuximab or panitumumab?",
+      "help": "Radiosensitising use and use within curative multimodal treatment do not count." },
+
+    { "key": "anti_egfr_intolerance", "label": "Grade ≥2 reaction to anti-EGFR therapy", "type": "boolean",
+      "question": "Have you had a significant intolerance or allergic reaction to an anti-EGFR treatment, or to other murine proteins?" },
+
+    { "key": "months_since_checkpoint", "label": "Months since immune checkpoint inhibitor", "type": "integer", "min": 0, "max": 600,
+      "question": "If you have had an immune checkpoint inhibitor such as pembrolizumab or nivolumab, how many months ago did it finish?",
+      "help": "Must be more than 6 months." },
+
+    { "key": "progression_within_6mo", "label": "Progression within 6 months of curative systemic therapy", "type": "boolean",
+      "question": "Did the cancer progress within 6 months of finishing systemic therapy given with curative intent?" },
+
+    { "key": "life_expectancy_months", "label": "Expected survival (months)", "type": "integer", "min": 0, "max": 240,
+      "question": "Has your care team discussed an expected prognosis? If so, roughly how many months?",
+      "help": "Must be at least 3 months. It is fine to skip this one." },
+
+    { "key": "cns_mets", "label": "Active CNS metastases or leptomeningeal disease", "type": "boolean",
+      "question": "Do you have active metastases in the brain or spine, or a history of carcinomatous meningitis?" },
+
+    { "key": "active_bleeding", "label": "Major bleeding", "type": "boolean",
+      "question": "Have you had a major bleeding episode in the last 4 weeks, or do you have active major bleeding?" },
+
+    { "key": "recent_investigational", "label": "Other investigational drug recently", "type": "boolean",
+      "question": "Have you taken another investigational drug in the last 4 weeks, or within 5 half-lives of it?" },
+
+    { "key": "autoimmune_active", "label": "Active autoimmune disease on systemic treatment", "type": "boolean",
+      "question": "Do you have an autoimmune condition that has needed systemic treatment in the past 2 years?" },
+
+    { "key": "hbv_active", "label": "Active hepatitis B", "type": "boolean",
+      "question": "Do you have chronic hepatitis B that is active and is not currently controlled with antiviral treatment?" },
+
+    { "key": "hcv_active", "label": "Untreated or detectable hepatitis C", "type": "boolean",
+      "question": "Have you had hepatitis C that has not been cured, or that is still detectable?" },
+
+    { "key": "hiv", "label": "Known HIV", "type": "boolean",
+      "question": "Do you have HIV?" },
+
+    { "key": "transplant", "label": "Organ or stem-cell transplant requiring immunosuppression", "type": "boolean",
+      "question": "Have you had an organ or stem-cell transplant that requires you to take immunosuppressive medicine?" },
+
+    { "key": "other_malignancy_recent", "label": "Another malignancy in the last 2 years", "type": "boolean",
+      "question": "Have you been diagnosed or treated for another cancer in the last 2 years?",
+      "help": "Curatively treated skin cancer, in situ cervical or breast cancer, and low-risk early prostate cancer do not count." },
+
+    { "key": "immunosuppressants", "label": "Corticosteroids or immunosuppressants recently", "type": "boolean",
+      "question": "In the last week, have you taken steroids by mouth (more than 10 mg prednisone a day) or another immunosuppressive medicine?",
+      "help": "Topical, inhaled, nasal and eye steroids do not count." },
+
+    { "key": "live_vaccine", "label": "Live vaccine in the last 4 weeks", "type": "boolean",
+      "question": "Have you had a live or live-attenuated vaccine in the last 4 weeks?" }
+  ],
+
+  "rules": [
+    { "id": "age-min", "kind": "inclusion", "field": "age", "op": ">=", "value": 18,
+      "text": "Age 18 or older on the day consent is signed", "required": true },
+    { "id": "confirmed", "kind": "inclusion", "field": "diagnosis_confirmed", "op": "is_true",
+      "text": "Histologically or cytologically confirmed disease", "required": true },
+    { "id": "site", "kind": "inclusion", "field": "primary_site", "op": "in",
+      "value": ["oral cavity", "hypopharynx", "larynx", "oropharynx"],
+      "text": "Primary in oral cavity, hypopharynx, larynx or oropharynx", "required": true },
+    { "id": "hpv", "kind": "inclusion", "field": "hpv_status",
+      "op": "conditional", "when": { "field": "primary_site", "equals": "oropharynx" },
+      "value": "negative",
+      "text": "Oropharyngeal primaries must be HPV-negative", "required": true },
+    { "id": "setting", "kind": "inclusion", "field": "setting", "op": "in",
+      "value": ["recurrent", "metastatic"],
+      "text": "Recurrent or metastatic disease", "required": true },
+    { "id": "no-prior-rm", "kind": "inclusion", "field": "prior_systemic_r_m", "op": "is_false",
+      "text": "No prior systemic therapy in the recurrent/metastatic setting", "required": true },
+    { "id": "adjuvant-gap", "kind": "inclusion", "field": "months_since_adjuvant", "op": ">=", "value": 6,
+      "text": "If prior adjuvant/definitive systemic therapy, more than 6 months have passed", "required": false },
+    { "id": "tissue", "kind": "inclusion", "field": "archival_tissue", "op": "is_true",
+      "text": "Archived tumour tissue, or willing to undergo pretreatment biopsy", "required": true },
+    { "id": "pd-l1", "kind": "inclusion", "field": "measurable_disease", "op": "is_true",
+      "text": "Measurable disease by RECIST 1.1 (assessed by the study team)", "required": true },
+    { "id": "ecog", "kind": "inclusion", "field": "ecog", "op": "in", "value": ["0", "1"],
+      "text": "ECOG performance status 0 or 1", "required": true },
+
+    { "id": "ex-local-curative", "kind": "exclusion", "field": "suitable_for_curative_local", "op": "is_true",
+      "text": "Disease suitable for curative-intent local therapy" },
+    { "id": "ex-tgfb", "kind": "exclusion", "field": "prior_anti_tgfb", "op": "is_true",
+      "text": "Prior anti-TGFβ therapy" },
+    { "id": "ex-egfr", "kind": "exclusion", "field": "prior_anti_egfr", "op": "is_true",
+      "text": "Prior anti-EGFR antibody therapy" },
+    { "id": "ex-egfr-intol", "kind": "exclusion", "field": "anti_egfr_intolerance", "op": "is_true",
+      "text": "Grade 2 or worse intolerance to anti-EGFR therapy or murine proteins" },
+    { "id": "ex-checkpoint-gap", "kind": "exclusion", "field": "months_since_checkpoint", "op": "<", "value": 6,
+      "text": "Immune checkpoint inhibitor completed within 6 months" },
+    { "id": "ex-progression", "kind": "exclusion", "field": "progression_within_6mo", "op": "is_true",
+      "text": "Progression within 6 months of curative-intent systemic therapy" },
+    { "id": "ex-survival", "kind": "exclusion", "field": "life_expectancy_months", "op": "<", "value": 3,
+      "text": "Life expectancy under 3 months" },
+    { "id": "ex-cns", "kind": "exclusion", "field": "cns_mets", "op": "is_true",
+      "text": "Active CNS metastases, cord compression, or leptomeningeal disease" },
+    { "id": "ex-bleeding", "kind": "exclusion", "field": "active_bleeding", "op": "is_true",
+      "text": "Active major bleeding, or a major bleed within 4 weeks" },
+    { "id": "ex-investigational", "kind": "exclusion", "field": "recent_investigational", "op": "is_true",
+      "text": "Another investigational drug within 4 weeks or 5 half-lives" },
+    { "id": "ex-autoimmune", "kind": "exclusion", "field": "autoimmune_active", "op": "is_true",
+      "text": "Active autoimmune disease requiring systemic treatment in the past 2 years" },
+    { "id": "ex-hbv", "kind": "exclusion", "field": "hbv_active", "op": "is_true",
+      "text": "Active hepatitis B not on suppressive antiviral therapy" },
+    { "id": "ex-hcv", "kind": "exclusion", "field": "hcv_active", "op": "is_true",
+      "text": "Hepatitis C not cured, or still detectable" },
+    { "id": "ex-hiv", "kind": "exclusion", "field": "hiv", "op": "is_true",
+      "text": "Known HIV" },
+    { "id": "ex-transplant", "kind": "exclusion", "field": "transplant", "op": "is_true",
+      "text": "Transplant requiring immunosuppression" },
+    { "id": "ex-malignancy", "kind": "exclusion", "field": "other_malignancy_recent", "op": "is_true",
+      "text": "Another malignancy within 2 years (with stated exceptions)" },
+    { "id": "ex-immunosuppressants", "kind": "exclusion", "field": "immunosuppressants", "op": "is_true",
+      "text": "Systemic corticosteroids above 10 mg prednisone, or other immunosuppressants, within 7 days" },
+    { "id": "ex-live-vaccine", "kind": "exclusion", "field": "live_vaccine", "op": "is_true",
+      "text": "Live or live-attenuated vaccine within 4 weeks" }
+  ]
+}

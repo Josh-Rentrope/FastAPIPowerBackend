@@ -21,6 +21,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY sessions.py FastAPIPostgresServer.py ./
 COPY api/ ./api/
+# The eligibility criteria and evaluator. Missing this is a crash at import, not a
+# degraded feature -- the API will not start without the module.
+COPY qualification/ ./qualification/
 
 # Run as a non-root user. Nothing here writes to the filesystem, so there is no
 # reason for the process to be able to.

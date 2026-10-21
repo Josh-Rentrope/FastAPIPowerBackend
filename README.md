@@ -116,6 +116,64 @@ index — `idx_locations_geom` for spatial, `idx_pd_title_trgm` for text,
 `idx_pd_status_updated` for status. `etl/06_verify.py` gates on this and exits
 non-zero if a plan regresses to a sequential scan.
 
+## Map clustering
+
+Server-side clustering runs below `CLUSTER_ZOOM_THRESHOLD` (default 12), above
+which the client clusters individual points. The grid is
+`CLUSTER_GRID_BASE * 2^(zoom - 3)` cells across, capped at `CLUSTER_GRID_MAX`, so
+resolution rises with zoom and the national view stays readable.
+
+Measured on the whole-US viewport (49,285 locations):
+
+| `CLUSTER_GRID_BASE` | clusters at zoom 3 | largest cluster |
+|---|---|---|
+| 4 | 20 | 11,865 |
+| **8 (default)** | **62** | 4,734 |
+| 16 | 206 | 3,367 |
+| 32 | 627 | 1,814 |
+| 64 | 1,687 | 1,506 |
+
+All three are environment variables, so the density can be tuned without a code
+change:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CLUSTER_GRID_BASE` | 8 | Cells at zoom 3. **Lower = fewer, bigger clusters when zoomed out.** |
+| `CLUSTER_GRID_MAX` | 1024 | Ceiling on cells, i.e. on marker count at high zoom. |
+| `CLUSTER_ZOOM_THRESHOLD` | 12 | Zoom at which the client takes over clustering. |
+
+A cell containing exactly one location is returned as the trial itself rather than
+a cluster of one, so it renders as a pin with a popup.
+
+## Eligibility screening
+
+`/api/qualify/*` screens a person against a protocol's transcribed
+inclusion/exclusion criteria, and the assistant drives the same engine
+conversationally — one question at a time, re-screening after every answer.
+
+```
+GET  /api/qualify/criteria          every criteria set, and which matcher is active
+GET  /api/qualify/criteria/{id}     questions and rules
+POST /api/qualify/{id}              {"answers": {...}} -> verdict + next questions
+```
+
+The verdict is one of `likely_eligible`, `ineligible`, or `needs_info`, and it is
+**never** a determination. Criteria that only a study team can establish — PD-L1
+CPS, RECIST measurability — are reported as unknown unless the patient has been
+told the answer, and even then they are marked "the study team must confirm".
+
+Criteria are JSON under `qualification/criteria/`, transcribed from protocol text.
+Adding a protocol means adding a file; no code changes.
+
+### The private seam
+
+Which rules exist is public. How answers are weighed is not.
+`qualification/matchers.py` loads an implementation from the entry-point group
+`clinical_trials.matchers` — the same shape as `bone_viewer.solvers` — falling back
+to a transparent reference matcher. A private package can register a better one
+without this repository changing, and `GET /api/qualify/criteria` reports
+`matcher.private: true` when one is in use.
+
 ## Bugs fixed in the rewrite
 
 Each of these was live, and several were silent:

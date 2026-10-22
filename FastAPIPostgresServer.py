@@ -748,12 +748,26 @@ def get_map_data(db=Depends(get_db),
                  bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
                  zoom: int = Query(..., description="Current map zoom level"),
                  q: Optional[str] = None, status: Optional[str] = None,
-                 phase: Optional[str] = None):
+                 phase: Optional[str] = None,
+                 age: Optional[int] = Query(None, ge=0, le=120),
+                 age_min: Optional[int] = Query(None, ge=0, le=120),
+                 age_max: Optional[int] = Query(None, ge=0, le=120),
+                 sex: Optional[str] = None,
+                 healthy_volunteer: Optional[bool] = None,
+                 fact: Optional[List[str]] = Query(None)):
     env = parse_bbox(bbox)
     assert env is not None  # bbox is required, so parse_bbox never returns None
     min_lon, min_lat, max_lon, max_lat = env
 
     clauses, params = build_filters(q, status, phase)
+    # Cluster counts must reflect the same pool as the list. Without these the
+    # zoomed-out map showed every study for the condition while the list showed
+    # the relevance-filtered set -- the map looked wrong, because it was.
+    elig_clauses, elig_params = eligibility_filters(
+        age, sex, healthy_volunteer, fact, age_min=age_min, age_max=age_max)
+    clauses.extend(elig_clauses)
+    params.update(elig_params)
+    has_eligibility = bool(elig_clauses)
     filtered = bool(clauses)          # captured before the spatial clause is added
     params.update(dict(zip(("min_lon", "min_lat", "max_lon", "max_lat"), env)))
 
@@ -761,7 +775,8 @@ def get_map_data(db=Depends(get_db),
     # that a point-in-envelope check does not need.
     clauses.append("l.geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)")
     clauses.append("l.geom IS NOT NULL")
-    where = "WHERE " + " AND ".join(clauses)
+    where_body = " AND ".join(clauses)
+    where = f"WHERE {where_body}"
 
     if zoom < CLUSTER_THRESHOLD:
         # ── grid resolution ──────────────────────────────────────────────────
@@ -799,12 +814,18 @@ def get_map_data(db=Depends(get_db),
         # locations.geom, measured at 106 ms.
         join_sql = (
             "JOIN study_locations sl ON sl.location_id = l.id "
-            "JOIN processed_data pd ON pd.nct_number = sl.study_nct_number"
+            "JOIN processed_data pd ON pd.nct_number = sl.study_nct_number "
+            + ("LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number "
+               if has_eligibility else "")
             if filtered else ""
         )
 
+        # `DISTINCT l.id` keeps a cell's count as "locations", which is what the
+        # singleton/site logic below assumes. A plain `count(*)` over the join
+        # counts study-location pairs, so a single location hosting three
+        # matching studies would become a cluster instead of a site.
         rows = db.execute(text(f"""
-            SELECT count(*) AS point_count,
+            SELECT count(DISTINCT l.id) AS point_count,
                    {lat_expr} AS latitude,
                    {lon_expr} AS longitude,
                    (array_agg(l.id))[1] AS sample_location_id
@@ -827,7 +848,7 @@ def get_map_data(db=Depends(get_db),
             # ROW_NUMBER rather than DISTINCT ON: a site can host thousands of
             # studies and the UI wants the five most recent, not an arbitrary one.
             # The window count gives the true total without a second query.
-            detail = db.execute(text("""
+            detail = db.execute(text(f"""
                 WITH ranked AS (
                     SELECT l.id AS location_id, l.location_text,
                            ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
@@ -845,10 +866,10 @@ def get_map_data(db=Depends(get_db),
                     JOIN study_locations sl ON sl.location_id = l.id
                     JOIN processed_data pd ON pd.nct_number = sl.study_nct_number
                     LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
-                    WHERE l.id = ANY(:ids)
+                    WHERE l.id = ANY(:ids) AND {where_body}
                 )
                 SELECT * FROM ranked WHERE rn <= 5
-            """), {"ids": singletons}).mappings().all()
+            """), {**params, "ids": singletons}).mappings().all()
             for d in detail:
                 by_location.setdefault(d["location_id"], []).append(dict(d))
                 location_total[d["location_id"]] = d["total_at_site"]

@@ -246,6 +246,8 @@ def get_conn(request: Request):
 
 class StudyLocation(BaseModel):
     location_text: str
+    city: Optional[str] = None
+    country_code: Optional[str] = None
     latitude: float
     longitude: float
     # Which rung of the geocode ladder produced this point. The UI can dim or
@@ -264,6 +266,13 @@ class Study(BaseModel):
     phase: Optional[str] = None
     sponsor: Optional[str] = None
     enrollment_count: Optional[int] = None
+    # Structured eligibility, straight from the registry's own module. These are
+    # the highest-signal fields a patient scans ("18+ · All sexes") and they cost
+    # one LEFT JOIN. Absent for studies with no eligibility record.
+    min_age_years: Optional[int] = None
+    max_age_years: Optional[int] = None
+    sex: Optional[str] = None
+    healthy_volunteers: Optional[bool] = None
     locations: List[StudyLocation] = []
 
     class Config:
@@ -464,9 +473,12 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
     rows = db.execute(text("""
         SELECT pd.nct_number, pd.study_title, pd.study_url, pd.acronym, pd.status,
                pd.conditions, pd.phase, pd.sponsor, pd.enrollment_count,
-               l.location_text, ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
+               te.min_age_years, te.max_age_years, te.sex, te.healthy_volunteers,
+               l.location_text, l.city, l.country_code,
+               ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
                l.geocode_precision
         FROM processed_data pd
+        LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
         LEFT JOIN study_locations sl ON pd.nct_number = sl.study_nct_number
         LEFT JOIN locations l ON sl.location_id = l.id
         WHERE pd.nct_number = ANY(:ids)
@@ -479,11 +491,15 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
             "nct_number": r["nct_number"], "study_title": r["study_title"],
             "study_url": r["study_url"], "acronym": r["acronym"], "status": r["status"],
             "conditions": r["conditions"], "phase": r["phase"], "sponsor": r["sponsor"],
-            "enrollment_count": r["enrollment_count"], "locations": [],
+            "enrollment_count": r["enrollment_count"],
+            "min_age_years": r["min_age_years"], "max_age_years": r["max_age_years"],
+            "sex": r["sex"], "healthy_volunteers": r["healthy_volunteers"],
+            "locations": [],
         })
         if r["location_text"] and r["latitude"] is not None:
             s["locations"].append({
                 "location_text": r["location_text"],
+                "city": r["city"], "country_code": r["country_code"],
                 "latitude": r["latitude"], "longitude": r["longitude"],
                 "precision": r["geocode_precision"],
             })
@@ -581,10 +597,12 @@ def get_map_data(db=Depends(get_db),
                 WITH ranked AS (
                     SELECT l.id AS location_id, l.location_text,
                            ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
-                           l.geocode_precision,
+                           l.geocode_precision, l.city, l.country_code,
                            pd.nct_number, pd.study_title, pd.study_url, pd.acronym,
                            pd.status, pd.conditions, pd.phase, pd.sponsor,
                            pd.enrollment_count,
+                           te.min_age_years, te.max_age_years, te.sex,
+                           te.healthy_volunteers,
                            count(*) OVER (PARTITION BY l.id) AS total_at_site,
                            row_number() OVER (PARTITION BY l.id
                                               ORDER BY pd.last_updated_date DESC NULLS LAST,
@@ -592,6 +610,7 @@ def get_map_data(db=Depends(get_db),
                     FROM locations l
                     JOIN study_locations sl ON sl.location_id = l.id
                     JOIN processed_data pd ON pd.nct_number = sl.study_nct_number
+                    LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
                     WHERE l.id = ANY(:ids)
                 )
                 SELECT * FROM ranked WHERE rn <= 5
@@ -611,8 +630,13 @@ def get_map_data(db=Depends(get_db),
                 "phase": d["phase"],
                 "sponsor": d["sponsor"],
                 "enrollment_count": d["enrollment_count"],
+                "min_age_years": d["min_age_years"],
+                "max_age_years": d["max_age_years"],
+                "sex": d["sex"],
+                "healthy_volunteers": d["healthy_volunteers"],
                 "locations": [{
                     "location_text": d["location_text"],
+                    "city": d["city"], "country_code": d["country_code"],
                     "latitude": d["latitude"],
                     "longitude": d["longitude"],
                     "precision": d["geocode_precision"],
@@ -646,11 +670,14 @@ def get_map_data(db=Depends(get_db),
     rows = db.execute(text(f"""
         SELECT pd.nct_number, pd.study_title, pd.study_url, pd.acronym, pd.status,
                pd.conditions, pd.phase, pd.sponsor, pd.enrollment_count,
-               l.location_text, ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
+               te.min_age_years, te.max_age_years, te.sex, te.healthy_volunteers,
+               l.location_text, l.city, l.country_code,
+               ST_Y(l.geom) AS latitude, ST_X(l.geom) AS longitude,
                l.geocode_precision
         FROM locations l
         JOIN study_locations sl ON sl.location_id = l.id
         JOIN processed_data pd ON pd.nct_number = sl.study_nct_number
+        LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
         {where}
     """), params).mappings().all()
 
@@ -660,7 +687,10 @@ def get_map_data(db=Depends(get_db),
             "nct_number": r["nct_number"], "study_title": r["study_title"],
             "study_url": r["study_url"], "acronym": r["acronym"], "status": r["status"],
             "conditions": r["conditions"], "phase": r["phase"], "sponsor": r["sponsor"],
-            "enrollment_count": r["enrollment_count"], "locations": [],
+            "enrollment_count": r["enrollment_count"],
+            "min_age_years": r["min_age_years"], "max_age_years": r["max_age_years"],
+            "sex": r["sex"], "healthy_volunteers": r["healthy_volunteers"],
+            "locations": [],
         })
         s["locations"].append({
             "location_text": r["location_text"],

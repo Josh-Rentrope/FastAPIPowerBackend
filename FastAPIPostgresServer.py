@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 from typing import List, Optional, Union
 
 import uvicorn
@@ -210,6 +211,32 @@ async def startup_db_client():
         with app.state.engine.connect() as c:
             c.execute(text("SELECT 1"))
         print("database connection ok")
+
+        # Running log of requests the assistant could not satisfy. Aggregating
+        # this is the feedback loop for adding tools and prompt fixes; without it
+        # the gaps are invisible and every round of improvement is a guess.
+        try:
+            with app.state.engine.begin() as c:
+                c.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tool_failures (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        session_id TEXT,
+                        conversation_id TEXT,
+                        kind TEXT NOT NULL,
+                        tool TEXT,
+                        request TEXT,
+                        detail TEXT,
+                        args JSONB
+                    )
+                """))
+                c.execute(text(
+                    "CREATE INDEX IF NOT EXISTS tool_failures_created_idx "
+                    "ON tool_failures (created_at DESC)"))
+            print("tool failure log ready")
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: could not create tool_failures: {exc}")
+
         print(f"cors origins: {CORS_ORIGINS}")
         print(f"chat: {'enabled' if ENABLE_CHAT and LLM_API_KEY else 'disabled'} "
               f"(model={CHAT_MODEL}, base_url={LLM_BASE_URL or 'default'})")
@@ -1023,6 +1050,15 @@ def get_map_data(db=Depends(get_db),
     return [Study.model_validate(s) for s in studies.values()]
 
 
+@main_router.get("/trials/{nct_number}")
+def get_trial_detail(nct_number: str, db=Depends(get_db)):
+    """Public detail for one NCT number, used by the chat's trial badges."""
+    data = _get_trial(db, nct_number=nct_number)
+    if data.get("error"):
+        raise HTTPException(404, data["error"])
+    return data
+
+
 # ── sessions ────────────────────────────────────────────────────────────────
 
 session_router = APIRouter(prefix="/api/session", tags=["Session"])
@@ -1062,6 +1098,61 @@ def read_session(request: Request, response: Response):
 # ── chat ────────────────────────────────────────────────────────────────────
 
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
+
+FAILURES_TOKEN = os.environ.get("FAILURES_TOKEN") or os.environ.get("ADMIN_TOKEN")
+
+
+def _require_failure_access(request: Request):
+    """The gap log contains reader requests, so it is not public.
+
+    With FAILURES_TOKEN set, the caller must present it. Without one, only a
+    loopback caller may read it -- useful locally, closed by default remotely.
+    """
+    if FAILURES_TOKEN:
+        supplied = request.headers.get("x-admin-token", "")
+        if not supplied or not secrets.compare_digest(supplied, FAILURES_TOKEN):
+            raise HTTPException(401, "admin token required")
+        return
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1"):
+        raise HTTPException(
+            403,
+            "failure log is loopback-only; set FAILURES_TOKEN for remote access",
+        )
+
+
+@chat_router.get("/failures")
+def list_failures(request: Request, db=Depends(get_db), limit: int = 100):
+    """The running gap list: unknown tools, tool errors, and unmet requests.
+
+    Aggregating this by kind/tool is how coverage improves deliberately rather
+    than by guessing which requests the assistant is failing.
+    """
+    _require_failure_access(request)
+    limit = max(1, min(int(limit or 100), 500))
+    try:
+        rows = db.execute(text("""
+            SELECT id, created_at, kind, tool, request, detail, args
+            FROM tool_failures
+            ORDER BY id DESC
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+        summary = db.execute(text("""
+            SELECT kind, tool, count(*) AS n
+            FROM tool_failures
+            GROUP BY kind, tool
+            ORDER BY n DESC
+        """)).mappings().all()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"failure log unavailable: {type(exc).__name__}",
+                "summary": [], "failures": []}
+
+    return {
+        "summary": [dict(r) for r in summary],
+        "failures": [
+            {**dict(r), "created_at": str(r["created_at"])} for r in rows
+        ],
+    }
 
 
 def _require_session(request: Request):
@@ -1467,6 +1558,29 @@ TOOL_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "record_unmet_request",
+            "description": (
+                "Record a request the available data cannot answer, then decline "
+                "gracefully. Use for flights or transport, hotels or lodging, "
+                "costs or insurance, booking an appointment, or contacting a "
+                "site. Do not mention tools, logging, or internal systems to the "
+                "reader."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request": {"type": "string",
+                                "description": "Short paraphrase of what the reader asked for"},
+                    "reason": {"type": "string",
+                               "description": "Why the available data cannot answer it"},
+                },
+                "required": ["request"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_qualification_protocols",
             "description": "List the eligibility criteria sets that can be "
                            "screened against conversationally.",
@@ -1594,6 +1708,13 @@ SYSTEM_PROMPT = (
     "9. If the person names a specific protocol from "
     "list_qualification_protocols, switch to screen_eligibility and ask its "
     "`next_questions` the same way.\n\n"
+    "WHEN YOU CANNOT HELP:\n"
+    "Call record_unmet_request for anything the data cannot answer -- flights or "
+    "transport, hotels or lodging, costs or insurance, booking an appointment, "
+    "or contacting a site. Then decline gracefully in plain language: say what "
+    "you cannot look up, without mentioning tools, APIs, or internal systems. If "
+    "it is a plausible future capability, you may say it might be added later, "
+    "but never promise a date.\n\n"
     "BOUNDARIES:\n"
     "10. You are screening, not deciding. Never say someone is eligible or "
     "ineligible -- say which criteria they appear to meet or not meet, and that "
@@ -1703,7 +1824,7 @@ def post_message(conv_id: str, body: dict, request: Request, db=Depends(get_db))
             "content": h["content"],
         })
 
-    reply = _run_llm(db, msgs)
+    reply = _run_llm(db, msgs, session_id=session["id"], conversation_id=conv_id)
 
     # Close whatever transaction the tool queries left open before writing.
     db.commit()
@@ -1766,24 +1887,73 @@ def _strip_dsml(text: str) -> str:
     return re.sub("<" + _DSML_CORE + r".*", "", text, flags=re.S).strip()
 
 
-def _execute_tool(db, name, raw_args, fn, allowed):
+def _log_failure(db, *, session_id, conversation_id, kind, tool=None,
+                 request=None, detail=None, args=None):
+    """Record one failure/gap. Best-effort: logging must never break chat."""
+    try:
+        db.execute(text("""
+            INSERT INTO tool_failures
+                (session_id, conversation_id, kind, tool, request, detail, args)
+            VALUES (:session_id, :conversation_id, :kind, :tool, :request,
+                    :detail, CAST(:args AS JSONB))
+        """), {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "kind": kind,
+            "tool": tool,
+            "request": (request or "")[:500] or None,
+            "detail": (detail or "")[:500] or None,
+            "args": json.dumps(args or {}, default=str),
+        })
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+
+
+def _execute_tool(db, name, raw_args, fn, allowed, *,
+                  session_id=None, conversation_id=None):
     """Run one tool, filtered to its declared arguments.
 
     The model chooses the argument names, so a stray key is filtered rather than
     raising a TypeError that would escape as a 500 (which a browser reports as a
-    CORS error). A failed tool becomes a result the model can explain.
+    CORS error). A failed tool becomes a result the model can explain, and is
+    written to the failure log for later analysis.
     """
+    if name == "record_unmet_request":
+        request = str(raw_args.get("request", ""))[:500]
+        reason = str(raw_args.get("reason", ""))[:500]
+        _log_failure(db, session_id=session_id, conversation_id=conversation_id,
+                     kind="unmet_request", tool=name, request=request,
+                     detail=reason, args=raw_args)
+        return {"recorded": True,
+                "note": ("Decline gracefully in prose. Do not mention tools, "
+                         "logging, or internal systems.")}
+
     if fn is None:
+        _log_failure(db, session_id=session_id, conversation_id=conversation_id,
+                     kind="unknown_tool", tool=name, detail="not in TOOL_REGISTRY",
+                     args=raw_args)
         return {"error": f"unknown tool {name!r}", "available": sorted(TOOL_REGISTRY)}
+
     args = {k: v for k, v in raw_args.items() if k in allowed}
     try:
-        return fn(db, **args)
+        result = fn(db, **args)
     except Exception as exc:  # noqa: BLE001
         db.rollback()
+        _log_failure(db, session_id=session_id, conversation_id=conversation_id,
+                     kind="tool_error", tool=name,
+                     detail=f"{type(exc).__name__}", args=raw_args)
         return {"error": f"{name} failed: {type(exc).__name__}"}
 
+    if isinstance(result, dict) and result.get("error"):
+        _log_failure(db, session_id=session_id, conversation_id=conversation_id,
+                     kind="tool_error", tool=name,
+                     detail=str(result.get("error"))[:500], args=raw_args)
+    return result
 
-def _run_llm(db, msgs: list[dict]) -> str:
+
+def _run_llm(db, msgs: list[dict], *, session_id=None,
+             conversation_id=None) -> str:
     """Run the model with tools until it answers.
 
     Handles both tool-call styles: structured `tool_calls` and DeepSeek's DSML
@@ -1832,7 +2002,9 @@ def _run_llm(db, msgs: list[dict]) -> str:
                     raw_args = {}
                 if not isinstance(raw_args, dict):
                     raw_args = {}
-                result = _execute_tool(db, name, raw_args, fn, allowed)
+                result = _execute_tool(
+                    db, name, raw_args, fn, allowed,
+                    session_id=session_id, conversation_id=conversation_id)
                 msgs.append({"role": "tool", "tool_call_id": call.id,
                              "name": name,
                              "content": json.dumps(result, default=str)})
@@ -1847,7 +2019,9 @@ def _run_llm(db, msgs: list[dict]) -> str:
             results = []
             for name, raw_args in dsml_calls:
                 fn, allowed = TOOL_REGISTRY.get(name, (None, set()))
-                result = _execute_tool(db, name, raw_args, fn, allowed)
+                result = _execute_tool(
+                    db, name, raw_args, fn, allowed,
+                    session_id=session_id, conversation_id=conversation_id)
                 results.append({"name": name, "arguments": raw_args,
                                 "result": result})
             msgs.append({

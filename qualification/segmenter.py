@@ -129,15 +129,26 @@ def entropy(counts: Iterable[int]) -> float:
 
 def _where(condition: str | None, status: str | None, answers: dict) -> tuple[str, dict]:
     """Candidate filter: filters first, structured fields, then answered facts."""
-    clauses = ["te.nct_number IS NOT NULL"]
+    # No eligibility gate here. The pool is LEFT-joined, so a study the registry
+    # has no eligibility rows for still counts -- exactly as it does in /studies.
+    # Gating it out made the shortlist size disagree with the result count shown
+    # after applying the answers, which reads as a bug because it is one.
+    clauses: list[str] = []
     params: dict = {}
 
     if condition:
-        clauses.append("pd.conditions ILIKE %(cond)s")
+        # Same predicate as /studies' `q`, deliberately. The shortlist count is
+        # shown to the reader and then has to match the result count after they
+        # apply it; searching only `conditions` here made those two numbers
+        # disagree by a few hundred, which reads as a bug because it is one.
+        clauses.append("(pd.study_title ILIKE %(cond)s OR pd.conditions ILIKE %(cond)s)")
         params["cond"] = f"%{condition}%"
     if status:
-        clauses.append("pd.status = %(status)s")
-        params["status"] = status
+        wanted = [x.strip().upper().replace(" ", "_")
+                  for x in status.split(",") if x.strip()]
+        if wanted:
+            clauses.append("pd.status = ANY(%(status)s)")
+            params["status"] = wanted
 
     age = answers.get("age")
     if isinstance(age, int):
@@ -150,7 +161,10 @@ def _where(condition: str | None, status: str | None, answers: dict) -> tuple[st
         clauses.append("(te.sex IS NULL OR te.sex = 'ALL' OR te.sex = %(sex)s)")
         params["sex"] = sex
 
-    if answers.get("healthy_volunteer") is False:
+    healthy = answers.get("healthy_volunteer")
+    if healthy is True:
+        clauses.append("te.healthy_volunteers = true")
+    elif healthy is False:
         clauses.append("coalesce(te.healthy_volunteers, false) = false")
 
     return " AND ".join(clauses), params
@@ -208,8 +222,8 @@ def next_question(cur, condition: str | None, status: str | None,
         SELECT count(*) FROM (
             SELECT pd.nct_number
             FROM processed_data pd
-            JOIN trial_eligibility te ON te.nct_number = pd.nct_number
-            WHERE {where}
+            LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
+            WHERE {where or "TRUE"}
             LIMIT {SAMPLE_LIMIT}
         ) x
     """, params)
@@ -223,8 +237,8 @@ def next_question(cur, condition: str | None, status: str | None,
         WITH pool AS (
             SELECT pd.nct_number
             FROM processed_data pd
-            JOIN trial_eligibility te ON te.nct_number = pd.nct_number
-            WHERE {where}
+            LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
+            WHERE {where or "TRUE"}
             LIMIT {SAMPLE_LIMIT}
         ),
         dist AS (

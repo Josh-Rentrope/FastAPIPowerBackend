@@ -256,6 +256,24 @@ class StudyLocation(BaseModel):
     precision: Optional[str] = None
 
 
+class StudyFit(BaseModel):
+    """How one study reads against the answers the reader gave.
+
+    `verdict` is deliberately not "eligible". The registry states criteria, not
+    outcomes, and half of any protocol is assessed by the study team. So this says
+    only what can be said from the answers and the listed criteria:
+
+      meets_listed    -- nothing the reader said conflicts, and every criterion the
+                         registry does state has been answered
+      check_with_site -- nothing conflicts, but the registry leaves something
+                         unstated that the reader would have to confirm
+      does_not_match  -- a stated criterion is contradicted; `reasons` says which
+    """
+    verdict: str                  # meets_listed | check_with_site | does_not_match
+    reasons: List[str] = []
+    unknown_count: int = 0
+
+
 class Study(BaseModel):
     nct_number: str
     study_title: str
@@ -273,6 +291,9 @@ class Study(BaseModel):
     max_age_years: Optional[int] = None
     sex: Optional[str] = None
     healthy_volunteers: Optional[bool] = None
+    # Present only when the reader has answered something. A plain browse has no
+    # "fit" to report, and inventing one would be a claim about the reader.
+    fit: Optional[StudyFit] = None
     locations: List[StudyLocation] = []
 
     class Config:
@@ -375,6 +396,161 @@ def build_filters(q, status, phase):
     return clauses, params
 
 
+def eligibility_filters(age, sex, healthy_volunteer, facts):
+    """Predicates over `trial_eligibility` and its extracted facts.
+
+    Kept separate from `build_filters` because these need a join the text filters
+    do not, and because they are only applied where a person's own answers are
+    known -- a plain browse should not silently exclude studies.
+
+    `facts` entries are "key:value:yes|no". A "yes" removes studies that EXCLUDE
+    the attribute; a "no" removes studies that REQUIRE it. Silence never excludes,
+    because a study that says nothing about prior chemotherapy is not a study that
+    forbids it.
+    """
+    clauses: list[str] = []
+    params: dict = {}
+
+    if isinstance(age, int):
+        clauses.append("(te.min_age_years IS NULL OR te.min_age_years <= :age)")
+        clauses.append("(te.max_age_years IS NULL OR te.max_age_years >= :age)")
+        params["age"] = age
+
+    if sex:
+        s = str(sex).upper()
+        if s in ("FEMALE", "MALE"):
+            clauses.append("(te.sex IS NULL OR te.sex = 'ALL' OR te.sex = :sex)")
+            params["sex"] = s
+
+    # `healthy_volunteers` is the registry's "accepts healthy volunteers" flag.
+    # A healthy reader wants studies that accept them; a reader with a diagnosis
+    # wants studies that do not. Both directions matter -- dropping the `true`
+    # branch meant "I am healthy" filtered nothing at all.
+    if healthy_volunteer is True:
+        clauses.append("te.healthy_volunteers = true")
+    elif healthy_volunteer is False:
+        clauses.append("coalesce(te.healthy_volunteers, false) = false")
+
+    for i, raw in enumerate(facts or []):
+        bits = str(raw).split(":", 2)
+        if len(bits) != 3:
+            continue
+        key, value, yn = bits
+        has = yn.strip().lower() in ("yes", "true", "1")
+        polarity = "exclude" if has else "require"
+        alias = f"f{i}"
+        clauses.append(
+            f"NOT EXISTS (SELECT 1 FROM trial_eligibility_facts {alias} "
+            f"WHERE {alias}.nct_number = pd.nct_number "
+            f"AND {alias}.fact_key = :fk{i} AND {alias}.fact_value = :fv{i} "
+            f"AND {alias}.polarity = '{polarity}')"
+        )
+        params[f"fk{i}"] = key.strip()
+        params[f"fv{i}"] = value.strip()
+
+    return clauses, params
+
+
+def _fact_label(key: str, value: str) -> str:
+    """A fact as a noun phrase a person can read: prior therapy (chemotherapy)."""
+    return f"{key.replace('_', ' ')} ({value.replace('_', ' ')})"
+
+
+def _fit_for_studies(db, studies: dict[str, dict], age, sex,
+                     healthy_volunteer, facts) -> dict[str, dict]:
+    """Per-study fit, from the answers the caller actually gave.
+
+    One extra query for the whole page rather than one per study. The verdict is
+    the honest one: `meets_listed` means "nothing you told us contradicts a
+    criterion the registry states", never "you are eligible" -- the registry does
+    not contain enough information to say that, and the study team does.
+    """
+    has_answers = (isinstance(age, int) or bool(sex)
+                   or healthy_volunteer is not None or bool(facts))
+    if not has_answers or not studies:
+        return {}
+
+    answered: dict[tuple[str, str], bool] = {}
+    for raw in facts or []:
+        bits = str(raw).split(":", 2)
+        if len(bits) != 3:
+            continue
+        key, value, yn = bits
+        answered[(key.strip(), value.strip())] = \
+            yn.strip().lower() in ("yes", "true", "1")
+
+    ids = list(studies)
+    rows = db.execute(text("""
+        SELECT nct_number, fact_key, fact_value, polarity
+        FROM trial_eligibility_facts
+        WHERE nct_number = ANY(:ids)
+    """), {"ids": ids}).mappings().all()
+
+    facts_by: dict[str, list[dict]] = {}
+    for r in rows:
+        facts_by.setdefault(r["nct_number"], []).append(dict(r))
+
+    out: dict[str, dict] = {}
+    sex_wanted = (sex or "").upper() if sex else ""
+    for nct, s in studies.items():
+        reasons: list[str] = []
+        unknown = 0
+
+        if isinstance(age, int):
+            lo, hi = s.get("min_age_years"), s.get("max_age_years")
+            if lo is not None and lo > age:
+                reasons.append(f"Study requires age {lo} or older")
+            if hi is not None and hi < age:
+                reasons.append(f"Study is limited to age {hi} or younger")
+        elif s.get("min_age_years") is not None or s.get("max_age_years") is not None:
+            unknown += 1  # age range listed, reader did not give an age
+
+        study_sex = (s.get("sex") or "").upper()
+        if sex_wanted in ("FEMALE", "MALE"):
+            if study_sex in ("FEMALE", "MALE") and study_sex != sex_wanted:
+                reasons.append(
+                    "Study is limited to " + ("women" if study_sex == "FEMALE" else "men"))
+        elif study_sex in ("FEMALE", "MALE"):
+            unknown += 1
+
+        hv = s.get("healthy_volunteers")
+        if healthy_volunteer is True and hv is False:
+            reasons.append("Study does not accept healthy volunteers")
+        elif healthy_volunteer is None and hv is not None:
+            unknown += 1
+
+        study_facts = facts_by.get(nct, [])
+        gated: set[tuple[str, str]] = set()
+        for f in study_facts:
+            pair = (f["fact_key"], f["fact_value"])
+            gated.add(pair)
+            if pair not in answered:
+                continue
+            has_it = answered[pair]
+            if has_it and f["polarity"] == "exclude":
+                reasons.append(f"Study excludes {_fact_label(*pair)}")
+            elif not has_it and f["polarity"] == "require":
+                reasons.append(f"Study requires {_fact_label(*pair)}")
+
+        if reasons:
+            verdict = "does_not_match"
+        else:
+            unknown += sum(1 for pair in gated if pair not in answered)
+            if not study_facts:
+                # The registry carries no structured eligibility for this study.
+                # Silence is not a conflict, and it is not a pass either.
+                verdict = "check_with_site"
+                unknown = max(unknown, 1)
+            elif unknown:
+                verdict = "check_with_site"
+            else:
+                verdict = "meets_listed"
+
+        out[nct] = {"verdict": verdict, "reasons": reasons[:4],
+                    "unknown_count": unknown}
+    return out
+
+
 def parse_bbox(bbox: str | None) -> Optional[tuple[float, float, float, float]]:
     if not bbox:
         return None
@@ -436,12 +612,19 @@ def stats(db=Depends(get_db)):
 @main_router.get("/studies", response_model=PaginatedStudies)
 def get_studies(db=Depends(get_db), q: Optional[str] = None,
                 status: Optional[str] = None, phase: Optional[str] = None,
-                bbox: Optional[str] = None, page: int = 1, limit: int = 10):
+                bbox: Optional[str] = None, page: int = 1, limit: int = 10,
+                age: Optional[int] = Query(None, ge=0, le=120),
+                sex: Optional[str] = None,
+                healthy_volunteer: Optional[bool] = None,
+                fact: Optional[List[str]] = Query(None)):
     limit = max(1, min(limit, 200))
     page = max(1, page)
     offset = (page - 1) * limit
 
     clauses, params = build_filters(q, status, phase)
+    elig_clauses, elig_params = eligibility_filters(age, sex, healthy_volunteer, fact)
+    clauses.extend(elig_clauses)
+    params.update(elig_params)
     env = parse_bbox(bbox)
     if env:
         # A semi-join driven by the GiST index, rather than the correlated EXISTS
@@ -458,12 +641,14 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
-    total = db.execute(text(f"SELECT count(*) FROM processed_data pd {where}"), params).scalar_one()
+    from_sql = ("processed_data pd "
+                "LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number")
+    total = db.execute(text(f"SELECT count(*) FROM {from_sql} {where}"), params).scalar_one()
     if total == 0:
         return {"total": 0, "page": page, "limit": limit, "data": []}
 
     ids = [r[0] for r in db.execute(text(f"""
-        SELECT pd.nct_number FROM processed_data pd {where}
+        SELECT pd.nct_number FROM {from_sql} {where}
         ORDER BY pd.last_updated_date DESC NULLS LAST
         LIMIT :limit OFFSET :offset
     """), {**params, "limit": limit, "offset": offset}).fetchall()]
@@ -503,6 +688,10 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
                 "latitude": r["latitude"], "longitude": r["longitude"],
                 "precision": r["geocode_precision"],
             })
+
+    for nct, fit in _fit_for_studies(
+            db, studies, age, sex, healthy_volunteer, fact).items():
+        studies[nct]["fit"] = fit
 
     ordered = sorted(studies.values(), key=lambda s: ids.index(s["nct_number"]))
     return {"total": total, "page": page, "limit": limit,

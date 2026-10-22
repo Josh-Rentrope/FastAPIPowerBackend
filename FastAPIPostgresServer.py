@@ -60,9 +60,12 @@ Configuration (all environment variables):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
+import urllib.parse
+import urllib.request
 from typing import List, Optional, Union
 
 import uvicorn
@@ -104,6 +107,13 @@ LLM_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
 LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL") or os.environ.get("LLM_BASE_URL")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
 ENABLE_CHAT = os.environ.get("ENABLE_CHAT", "1") == "1"
+
+# Places data for the logistics tool. Reuses the public Mapbox token the front
+# end already ships; a dedicated backend token is preferable in production.
+MAPBOX_TOKEN = (
+    os.environ.get("MAPBOX_TOKEN")
+    or os.environ.get("NEXT_PUBLIC_MAPBOX_TOKEN")
+)
 
 # ── map clustering ──────────────────────────────────────────────────────────
 #
@@ -1059,6 +1069,18 @@ def get_trial_detail(nct_number: str, db=Depends(get_db)):
     return data
 
 
+@main_router.get("/logistics")
+def get_logistics(db=Depends(get_db), place: Optional[str] = None,
+                  lat: Optional[float] = None, lng: Optional[float] = None,
+                  radius_miles: int = 10,
+                  kinds: str = "airport,transit,hotel,taxi",
+                  limit: int = 5):
+    """Nearby airports, transit, hotels and taxi stands around a place."""
+    return _search_logistics(
+        db, place=place, lat=lat, lng=lng, radius_miles=radius_miles,
+        kinds=kinds, limit=limit)
+
+
 # ── sessions ────────────────────────────────────────────────────────────────
 
 session_router = APIRouter(prefix="/api/session", tags=["Session"])
@@ -1100,25 +1122,40 @@ def read_session(request: Request, response: Response):
 chat_router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
 FAILURES_TOKEN = os.environ.get("FAILURES_TOKEN") or os.environ.get("ADMIN_TOKEN")
+FAILURES_ALLOWED_IPS = {
+    ip.strip()
+    for ip in os.environ.get("FAILURES_ALLOWED_IPS", "").split(",")
+    if ip.strip()
+}
+
+
+def _client_ip(request: Request) -> str:
+    # App Platform terminates TLS and forwards the original address here.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else ""
 
 
 def _require_failure_access(request: Request):
     """The gap log contains reader requests, so it is not public.
 
-    With FAILURES_TOKEN set, the caller must present it. Without one, only a
-    loopback caller may read it -- useful locally, closed by default remotely.
+    Two locks for remote access: the caller must be in FAILURES_ALLOWED_IPS and
+    must present FAILURES_TOKEN. Loopback is always allowed for local
+    inspection. The token is the durable control -- X-Forwarded-For can be
+    spoofed by a direct caller, but a spoofed address without the token is
+    useless.
     """
-    if FAILURES_TOKEN:
-        supplied = request.headers.get("x-admin-token", "")
-        if not supplied or not secrets.compare_digest(supplied, FAILURES_TOKEN):
-            raise HTTPException(401, "admin token required")
+    ip = _client_ip(request)
+    if ip in ("127.0.0.1", "::1"):
         return
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1"):
-        raise HTTPException(
-            403,
-            "failure log is loopback-only; set FAILURES_TOKEN for remote access",
-        )
+    if ip not in FAILURES_ALLOWED_IPS:
+        raise HTTPException(403, "not allowed from this address")
+    if not FAILURES_TOKEN:
+        raise HTTPException(403, "remote access requires FAILURES_TOKEN")
+    supplied = request.headers.get("x-admin-token", "")
+    if not supplied or not secrets.compare_digest(supplied, FAILURES_TOKEN):
+        raise HTTPException(401, "admin token required")
 
 
 @chat_router.get("/failures")
@@ -1379,6 +1416,278 @@ def _get_trial(db, nct_number=None):
     return data
 
 
+def _haversine_miles(lat1, lon1, lat2, lon2):
+    r = 3958.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _geocode_place(db, place: str) -> dict | None:
+    """Resolve a place from the registry first, then OpenStreetMap/Nominatim."""
+    resolved = _resolve_place(db, place)
+    if resolved:
+        return resolved
+    try:
+        url = ("https://nominatim.openstreetmap.org/search?"
+               + urllib.parse.urlencode(
+                   {"q": place, "format": "json", "limit": 1}))
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "ClinicalTrialsAssistant/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+        if data:
+            first = data[0]
+            return {
+                "city": (first.get("display_name") or place)[:120],
+                "admin1": None,
+                "country_code": None,
+                "latitude": float(first["lat"]),
+                "longitude": float(first["lon"]),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+_OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+)
+
+
+def _overpass(query: str):
+    """Run an Overpass query against the global instance, then the regional one.
+
+    The main instance is frequently at capacity (502); osm.ch is a Switzerland
+    extract and will return nothing for US places, but it is a harmless last try.
+    """
+    for endpoint in _OVERPASS_ENDPOINTS:
+        try:
+            url = endpoint + "?" + urllib.parse.urlencode({"data": query})
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "ClinicalTrialsAssistant/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+_MAPBOX_CATEGORIES = {
+    "hotel": ("hotel",),
+    "airport": ("airport",),
+    "transit": ("train_station", "bus_station"),
+    "taxi": ("taxi",),
+}
+
+
+def _name_key(name: str) -> str:
+    """A forgiving key so 'Red Ride Shuttle Inc.' and '... Inc' collapse."""
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+
+
+def _mapbox_places(lat, lng, category, radius_miles):
+    """One Mapbox Search Box category, filtered to the radius, in miles."""
+    if not MAPBOX_TOKEN:
+        return []
+    url = (
+        "https://api.mapbox.com/search/searchbox/v1/category/"
+        + urllib.parse.quote(category)
+        + "?"
+        + urllib.parse.urlencode({
+            "proximity": f"{lng},{lat}",
+            "limit": 25,
+            "access_token": MAPBOX_TOKEN,
+        })
+    )
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "ClinicalTrialsAssistant/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except Exception:  # noqa: BLE001
+        return []
+
+    out = []
+    for feature in data.get("features", []):
+        props = feature.get("properties") or {}
+        coords = (feature.get("geometry") or {}).get("coordinates") or []
+        if len(coords) < 2:
+            continue
+        name = props.get("name") or props.get("name_preferred")
+        if not name:
+            continue
+        plat, plng = float(coords[1]), float(coords[0])
+        distance = _haversine_miles(lat, lng, plat, plng)
+        if distance > radius_miles:
+            continue
+        out.append({
+            "name": name,
+            "distance_miles": round(distance, 1),
+            "latitude": plat,
+            "longitude": plng,
+            "address": props.get("full_address") or props.get("place_formatted"),
+            "iata": None,
+        })
+    return out
+
+
+def _overpass_places(lat, lng, radius, kinds):
+    """OpenStreetMap fallback. Returns None when every endpoint is unavailable."""
+    radius_m = radius * 1609.344
+    parts = []
+    if "airport" in kinds:
+        parts.append(f'nwr["aeroway"="aerodrome"](around:{radius_m},{lat},{lng});')
+    if "hotel" in kinds:
+        parts.append(f'nwr["tourism"="hotel"](around:{radius_m},{lat},{lng});')
+    if "taxi" in kinds:
+        parts.append(f'nwr["amenity"="taxi"](around:{radius_m},{lat},{lng});')
+    if "transit" in kinds:
+        parts.append(f'nwr["railway"="station"](around:{radius_m},{lat},{lng});')
+        parts.append(f'nwr["amenity"="bus_station"](around:{radius_m},{lat},{lng});')
+        parts.append(f'nwr["public_transport"="station"](around:{radius_m},{lat},{lng});')
+    query = f"[out:json][timeout:25];({' '.join(parts)});out center tags 300;"
+    data = _overpass(query)
+    if data is None:
+        return None
+
+    out = []
+    seen = set()
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name:
+            continue
+        lat_e, lon_e = el.get("lat"), el.get("lon")
+        if lat_e is None or lon_e is None:
+            center = el.get("center") or {}
+            lat_e, lon_e = center.get("lat"), center.get("lon")
+        if lat_e is None or lon_e is None:
+            continue
+        if tags.get("aeroway") == "aerodrome":
+            kind = "airport"
+        elif tags.get("tourism") == "hotel":
+            kind = "hotel"
+        elif tags.get("amenity") == "taxi":
+            kind = "taxi"
+        elif (tags.get("railway") == "station"
+              or tags.get("amenity") == "bus_station"
+              or tags.get("public_transport") == "station"):
+            kind = "transit"
+        else:
+            continue
+        if kind not in kinds:
+            continue
+        key = (kind, _name_key(name))
+        if key in seen:
+            continue
+        seen.add(key)
+        address = " ".join(filter(None, [
+            tags.get("addr:housenumber"), tags.get("addr:street"),
+            tags.get("addr:city"),
+        ]))
+        out.append({
+            "name": name,
+            "kind": kind,
+            "distance_miles": round(_haversine_miles(
+                lat, lng, float(lat_e), float(lon_e)), 1),
+            "latitude": float(lat_e),
+            "longitude": float(lon_e),
+            "iata": tags.get("iata"),
+            "address": address or None,
+        })
+    return out
+
+
+def _search_logistics(db, place=None, lat=None, lng=None, radius_miles=10,
+                      kinds=None, limit=5):
+    """Nearby airports, transit, hotels and taxi stands.
+
+    Mapbox Search Box when MAPBOX_TOKEN is configured (reliable and includes US
+    places), with OpenStreetMap/Overpass as a no-key fallback. Names and
+    straight-line miles only: no schedules, prices, availability, or booking.
+    """
+    allowed = {"airport", "transit", "hotel", "taxi"}
+    if isinstance(kinds, str):
+        kinds = [k.strip().lower() for k in kinds.split(",") if k.strip()]
+    if not isinstance(kinds, list) or not kinds:
+        kinds = sorted(allowed)
+    kinds = list(dict.fromkeys(
+        k.lower() for k in kinds if isinstance(k, str) and k.lower() in allowed))
+    if not kinds:
+        return {"error": "kinds must include airport, transit, hotel or taxi"}
+
+    lat_n, lng_n = _as_number(lat), _as_number(lng)
+    if lat_n is None or lng_n is None:
+        if not place:
+            return {"error": "provide a place, or both lat and lng"}
+        resolved = _geocode_place(db, place)
+        if not resolved:
+            return {"error": f"could not resolve {place!r}"}
+        lat_n, lng_n = float(resolved["latitude"]), float(resolved["longitude"])
+    else:
+        resolved = {"city": None, "admin1": None, "country_code": None,
+                    "latitude": lat_n, "longitude": lng_n}
+
+    try:
+        radius = max(1, min(int(radius_miles or 10), 50))
+    except (TypeError, ValueError):
+        radius = 10
+    try:
+        cap = max(1, min(int(limit or 5), 10))
+    except (TypeError, ValueError):
+        cap = 5
+
+    buckets = {k: [] for k in kinds}
+    seen = set()
+    source = None
+
+    if MAPBOX_TOKEN:
+        for kind in kinds:
+            for category in _MAPBOX_CATEGORIES[kind]:
+                for item in _mapbox_places(lat_n, lng_n, category, radius):
+                    key = (kind, _name_key(item["name"]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    buckets[kind].append({**item, "kind": kind})
+        if any(buckets.values()):
+            source = "mapbox"
+
+    if source is None:
+        fallback = _overpass_places(lat_n, lng_n, radius, kinds)
+        if fallback is None:
+            return {"error": "the map data service did not respond",
+                    "detail": ("Mapbox and OpenStreetMap/Overpass were both "
+                               "unavailable; try again shortly."),
+                    "place": resolved}
+        for item in fallback:
+            kind = item["kind"]
+            key = (kind, _name_key(item["name"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            buckets[kind].append(item)
+        source = "openstreetmap"
+
+    results = {}
+    for kind, items in buckets.items():
+        items.sort(key=lambda x: x["distance_miles"])
+        if items:
+            results[kind] = items[:cap]
+    return {
+        "place": resolved,
+        "radius_miles": radius,
+        "source": source,
+        "results": results,
+        "note": ("Straight-line distances. No schedules, prices, availability, "
+                 "or booking."),
+    }
+
+
 def _clean_search(search) -> dict | None:
     """Validate the page's current search before it enters the system prompt.
 
@@ -1558,13 +1867,47 @@ TOOL_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "search_logistics",
+            "description": (
+                "Find nearby airports, train/bus stations, hotels and taxi stand "
+                "locations around a place. Returns names and straight-line miles. "
+                "It cannot provide schedules, prices, availability, or booking; "
+                "say that plainly and do not imply otherwise."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place": {"type": "string",
+                              "description": "City and optional region, e.g. 'Chapel Hill, NC'"},
+                    "lat": {"type": "number"},
+                    "lng": {"type": "number"},
+                    "radius_miles": {"type": "number",
+                                     "description": "Default 10, maximum 50"},
+                    "kinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["airport", "transit", "hotel", "taxi"],
+                        },
+                        "description": "Default: all four",
+                    },
+                    "limit": {"type": "integer",
+                              "description": "Max per kind, default 5"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_unmet_request",
             "description": (
                 "Record a request the available data cannot answer, then decline "
-                "gracefully. Use for flights or transport, hotels or lodging, "
-                "costs or insurance, booking an appointment, or contacting a "
-                "site. Do not mention tools, logging, or internal systems to the "
-                "reader."
+                "gracefully. Use for flight schedules or prices, hotel "
+                "availability or rates, booking, costs or insurance, or "
+                "contacting a site. Do not mention tools, logging, or internal "
+                "systems to the reader."
             ),
             "parameters": {
                 "type": "object",
@@ -1667,6 +2010,9 @@ TOOL_REGISTRY = {
         "limit", "age", "age_min", "age_max", "sex", "healthy_volunteer", "facts",
     }),
     "get_trial": (_get_trial, {"nct_number"}),
+    "search_logistics": (_search_logistics, {
+        "place", "lat", "lng", "radius_miles", "kinds", "limit",
+    }),
 }
 
 SYSTEM_PROMPT = (
@@ -1703,26 +2049,30 @@ SYSTEM_PROMPT = (
     "and returns distance_miles for every trial. If the reader says 'near me', use "
     "user_location from CURRENT SEARCH CONTEXT; if it is absent, ask for a city "
     "(optionally with a state) rather than guessing.\n"
-    "8. For a specific NCT number, call get_trial and use its locations and "
+    "8. For hotels, taxis/rideshares, transit, or airports near a place, call "
+    "search_logistics. It returns names and straight-line miles. It cannot see "
+    "availability, prices, schedules, or booking; say that plainly, and note "
+    "that travel reimbursement is only something the study team can confirm.\n"
+    "9. For a specific NCT number, call get_trial and use its locations and "
     "eligibility_facts rather than inferring details from a search snippet.\n"
-    "9. If the person names a specific protocol from "
+    "10. If the person names a specific protocol from "
     "list_qualification_protocols, switch to screen_eligibility and ask its "
     "`next_questions` the same way.\n\n"
     "WHEN YOU CANNOT HELP:\n"
-    "Call record_unmet_request for anything the data cannot answer -- flights or "
-    "transport, hotels or lodging, costs or insurance, booking an appointment, "
-    "or contacting a site. Then decline gracefully in plain language: say what "
-    "you cannot look up, without mentioning tools, APIs, or internal systems. If "
-    "it is a plausible future capability, you may say it might be added later, "
-    "but never promise a date.\n\n"
+    "Call record_unmet_request for anything the data cannot answer -- flight "
+    "schedules or prices, hotel availability or rates, booking, costs or "
+    "insurance, or contacting a site. Then decline gracefully in plain language: "
+    "say what you cannot look up, without mentioning tools, APIs, or internal "
+    "systems. If it is a plausible future capability, you may say it might be "
+    "added later, but never promise a date.\n\n"
     "BOUNDARIES:\n"
-    "10. You are screening, not deciding. Never say someone is eligible or "
+    "11. You are screening, not deciding. Never say someone is eligible or "
     "ineligible -- say which criteria they appear to meet or not meet, and that "
     "the study team confirms it with tests.\n"
-    "11. If someone declines a question, move on. It is reported as unknown and "
+    "12. If someone declines a question, move on. It is reported as unknown and "
     "never assumed either way.\n"
-    "12. Be conversational and brief. No questionnaires, no walls of text.\n"
-    "13. This is health information, not medical advice. Encourage them to raise "
+    "13. Be conversational and brief. No questionnaires, no walls of text.\n"
+    "14. This is health information, not medical advice. Encourage them to raise "
     "anything concerning with their care team."
 )
 
@@ -1824,7 +2174,16 @@ def post_message(conv_id: str, body: dict, request: Request, db=Depends(get_db))
             "content": h["content"],
         })
 
-    reply = _run_llm(db, msgs, session_id=session["id"], conversation_id=conv_id)
+    try:
+        reply = _run_llm(
+            db, msgs, session_id=session["id"], conversation_id=conv_id)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        _log_failure(db, session_id=session["id"], conversation_id=conv_id,
+                     kind="chat_error", detail=f"{type(exc).__name__}: {exc}")
+        reply = ("I'm sorry — I hit a problem while working on that. Please "
+                 "try again in a moment. The trial search and the map are "
+                 "still available.")
 
     # Close whatever transaction the tool queries left open before writing.
     db.commit()
@@ -1979,12 +2338,22 @@ def _run_llm(db, msgs: list[dict], *, session_id=None,
                 model=CHAT_MODEL, messages=msgs, tools=TOOL_SCHEMA,
                 tool_choice="auto")
         except Exception as exc:  # noqa: BLE001
-            return f"The model is unreachable right now ({type(exc).__name__})."
+            _log_failure(db, session_id=session_id,
+                         conversation_id=conversation_id,
+                         kind="model_unreachable",
+                         detail=f"{type(exc).__name__}: {exc}")
+            return ("I'm sorry — the assistant is temporarily unavailable. "
+                    "The trial search and the map still work. Please try again "
+                    "in a moment.")
 
         # An empty `choices` list is legal in some OpenAI-compatible
         # implementations and would be an IndexError otherwise.
         if not getattr(response, "choices", None):
-            return "The model returned no answer."
+            _log_failure(db, session_id=session_id,
+                         conversation_id=conversation_id,
+                         kind="chat_error", detail="model returned no choices")
+            return ("I'm sorry — I didn't get a usable answer that time. "
+                    "Please try again.")
 
         choice = response.choices[0].message
         content = choice.content or ""
@@ -2037,7 +2406,12 @@ def _run_llm(db, msgs: list[dict], *, session_id=None,
 
         return _strip_dsml(content) or "No answer was produced."
 
-    return _strip_dsml(last_content) or "The assistant could not finish that request."
+    _log_failure(db, session_id=session_id, conversation_id=conversation_id,
+                 kind="chat_error", detail="tool loop exhausted",
+                 args={"last_content": last_content[:300]})
+    return ("I'm sorry — I got stuck working on that one. Could you rephrase "
+            "it? I can still search trials, check eligibility, or look up "
+            "nearby sites.")
 
 
 # ── routers ─────────────────────────────────────────────────────────────────

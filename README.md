@@ -179,6 +179,76 @@ to a transparent reference matcher. A private package can register a better one
 without this repository changing, and `GET /api/qualify/criteria` reports
 `matcher.private: true` when one is in use.
 
+## Eligibility data: where it comes from
+
+The 30-column CSV used for the main load has **no eligibility column** — it stops
+at Study Documents. Eligibility lives only in the JSON API, so it is fetched
+separately:
+
+```
+GET /api/v2/studies?fields=NCTId,EligibilityModule&pageSize=1000
+```
+
+~608 paged requests for the whole registry. `etl/07_fetch_eligibility.py` runs
+them politely, persists its cursor, and resumes after an interruption.
+
+**The important discovery:** the API returns the highest-yield fields already
+structured.
+
+| field | example |
+|---|---|
+| `sex` | `ALL` / `FEMALE` / `MALE` |
+| `minimumAge` | `18 Years` |
+| `maximumAge` | `75 Years` |
+| `healthyVolunteers` | `true` / `false` |
+| `stdAges` | `["ADULT", "OLDER_ADULT"]` |
+
+So age and sex — the two questions that filter hardest — need no parsing and no
+model. They are form fields, applied as SQL predicates.
+
+Only `eligibilityCriteria` is prose. It is stored **verbatim** in
+`trial_eligibility.criteria_text` so interpretation can be redone without ever
+refetching. `etl/08_extract_eligibility_facts.py` turns it into rows in
+`trial_eligibility_facts` — prior therapy, biomarkers, pregnancy, infection — each
+carrying the sentence it came from, a confidence, and `method = rule`. Rules are
+deliberately conservative: a rule that is unsure stays silent, because a missing
+fact means "ask someone" and a wrong fact means bad screening.
+
+`method` is the classifier seam. A better extractor writes rows here with
+`method = classifier/1` and no consumer changes.
+
+## Choosing the next question
+
+With 607k studies a patient may match thousands, and asking every criterion of
+every protocol is untenable. `/api/qualify/segment` picks the **single most
+informative next question**:
+
+```
+GET  /api/qualify/segment?condition=melanoma&status=RECRUITING
+POST /api/qualify/segment   {"condition": ..., "answers": {"age": 45, "facts": {...}}}
+```
+
+This is arithmetic, not a model call. Every candidate fact partitions the pool
+into three groups — trials that *require* it, trials that *exclude* it, and trials
+silent on it — and the question is chosen by the **entropy of that partition**: a
+question that puts 90% of trials in one bucket teaches almost nothing. Questions
+with no discrimination are skipped rather than asked and wasted.
+
+Because it is deterministic it is free, reproducible, and cannot invent a question
+whose answer means nothing. The model's job is reduced to phrasing — and the
+question text comes from a fixed mapping, so even that is mostly prewritten.
+
+The intended funnel:
+
+1. **Form** — age, sex, healthy volunteer. Collected once, never asked in chat.
+2. **`narrow_trials`** — one high-gain question per turn until nothing discriminates.
+3. **`search_clinical_trials`** — present the shortlist with NCT numbers.
+4. **`screen_eligibility`** — only if the person names a specific protocol, for a
+   per-rule verdict on that one study.
+
+Free-text conversation is the fallback, not the mechanism. The model is used where
+language is genuinely required; everything else is SQL and arithmetic.
+
 ## Bugs fixed in the rewrite
 
 Each of these was live, and several were silent:

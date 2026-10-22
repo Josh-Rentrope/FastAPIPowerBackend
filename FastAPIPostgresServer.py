@@ -819,6 +819,22 @@ def _screen_eligibility(db, criteria_id=None, answers=None):
     return qualification.load_matcher().evaluate(c, answers).as_dict()
 
 
+def _narrow_trials(db, condition=None, status=None, answers=None):
+    """Pick the next question that best splits the remaining trials.
+
+    Pure arithmetic over the candidate pool (entropy of the partition), not a
+    model call: it is free, deterministic, and cannot invent a question whose
+    answer means nothing.
+    """
+    conn = db.get_bind().raw_connection()
+    try:
+        cur = conn.cursor()
+        return qualification.segmenter.next_question(
+            cur, condition, status, answers or {})
+    finally:
+        conn.close()
+
+
 TOOL_SCHEMA = [
     {
         "type": "function",
@@ -879,6 +895,36 @@ TOOL_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "narrow_trials",
+            "description": (
+                "Choose the single most informative next question for narrowing a "
+                "set of candidate trials. Returns a question, how many trials "
+                "remain, and how many a yes or a no would remove. Use this instead "
+                "of inventing questions. Collect age, sex and healthy-volunteer "
+                "status as form fields first; this covers everything else."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "condition": {"type": "string", "description": "e.g. 'melanoma'"},
+                    "status": {"type": "string", "enum": sorted(KNOWN_STATUSES)},
+                    "answers": {
+                        "type": "object",
+                        "description": (
+                            "Everything answered so far. age (integer), sex "
+                            "('female'|'male'), healthy_volunteer (boolean), and "
+                            "facts as {\"prior_therapy:chemotherapy\": true}. "
+                            "Answer keys come from previous responses."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 # name -> (callable, accepted argument names). The filter matters: the model picks
@@ -888,26 +934,36 @@ TOOL_REGISTRY = {
     "search_clinical_trials": (_search_trials, {"q", "status", "phase", "limit"}),
     "list_qualification_protocols": (_list_protocols, set()),
     "screen_eligibility": (_screen_eligibility, {"criteria_id", "answers"}),
+    "narrow_trials": (_narrow_trials, {"condition", "status", "answers"}),
 }
 
 SYSTEM_PROMPT = (
     "You are a clinical trial discovery assistant. You help people find trials and "
     "work out whether a trial's stated criteria could apply to them.\n\n"
-    "RULES:\n"
-    "1. Answer only from tool results. Always call search_clinical_trials before "
-    "answering a question about trials, and cite trials by their NCT number "
-    "verbatim. If a tool returns nothing, say so plainly -- a fabricated NCT "
-    "number is worse than no answer.\n"
-    "2. For eligibility, call list_qualification_protocols, then ask the person "
-    "ONE question at a time from the returned `next_questions`, in order. Their "
-    "wording is already written for a patient; use it. After each answer, call "
-    "screen_eligibility again with all answers so far.\n"
-    "3. You are screening, not deciding. Never say someone is eligible or "
+    "HOW TO WORK, IN ORDER:\n"
+    "1. Never state a fact about trials from memory. Call search_clinical_trials "
+    "first, and cite every trial by its NCT number verbatim. If a tool returns "
+    "nothing, say so plainly -- a fabricated NCT number is worse than no answer.\n"
+    "2. Collect age, sex and healthy-volunteer status ONCE, together, as a short "
+    "form. Do not drip these out one per turn; they are the same questions every "
+    "form already asks and making someone answer them in chat is tedious.\n"
+    "3. Then narrow. Call narrow_trials with the accumulated answers. It returns "
+    "the single most informative question, already phrased for a patient, plus "
+    "how many trials remain. Ask exactly that question, one per turn, and pass "
+    "every answer back next time. Never invent your own question.\n"
+    "4. When narrow_trials returns no question, the pool is as small as it gets. "
+    "Call search_clinical_trials and present the shortlist with NCT numbers.\n"
+    "5. If the person names a specific protocol from "
+    "list_qualification_protocols, switch to screen_eligibility and ask its "
+    "`next_questions` the same way.\n\n"
+    "BOUNDARIES:\n"
+    "6. You are screening, not deciding. Never say someone is eligible or "
     "ineligible -- say which criteria they appear to meet or not meet, and that "
-    "the study team confirms it.\n"
-    "4. Be conversational and brief. Do not dump a questionnaire. If someone "
-    "declines a question, move on; it will be reported as unknown.\n"
-    "5. This is health information, not medical advice. Encourage them to discuss "
+    "the study team confirms it with tests.\n"
+    "7. If someone declines a question, move on. It is reported as unknown and "
+    "never assumed either way.\n"
+    "8. Be conversational and brief. No questionnaires, no walls of text.\n"
+    "9. This is health information, not medical advice. Encourage them to raise "
     "anything concerning with their care team."
 )
 

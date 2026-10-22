@@ -279,6 +279,48 @@ TABLES: list[tuple[str, str]] = [
         );
     """),
 
+    # ── eligibility ──────────────────────────────────────────────────────────
+    #
+    # The CSV export used for the main load has no eligibility column at all, so
+    # this is fetched separately from the API's EligibilityModule.
+    #
+    # The important discovery is that the highest-yield fields arrive ALREADY
+    # STRUCTURED: sex, minimumAge, maximumAge, healthyVolunteers and stdAges are
+    # discrete values, not prose. Those drive most of the screening, need no
+    # model, and are exact. Only the free text needs interpreting, and it is
+    # stored verbatim so the interpretation can be redone without a refetch.
+    ("trial_eligibility", """
+        CREATE TABLE IF NOT EXISTS trial_eligibility (
+            nct_number        TEXT PRIMARY KEY,
+            criteria_text     TEXT,
+            sex               TEXT,          -- ALL | FEMALE | MALE
+            min_age_years     INTEGER,
+            max_age_years     INTEGER,
+            healthy_volunteers BOOLEAN,
+            std_ages          TEXT[],        -- CHILD, ADULT, OLDER_ADULT
+            fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+            extractor_version TEXT
+        );
+    """),
+
+    # Facts derived from the free text. Separate from the table above because
+    # this layer will be re-run whenever the parser or classifier improves, and
+    # a refetch of 607k studies should never be needed to do that.
+    ("trial_eligibility_facts", """
+        CREATE TABLE IF NOT EXISTS trial_eligibility_facts (
+            nct_number  TEXT NOT NULL,
+            fact_key    TEXT NOT NULL,       -- prior_therapy, biomarker, pregnancy, ...
+            fact_value  TEXT NOT NULL,
+            polarity    TEXT,                -- require | exclude
+            confidence  REAL,
+            method      TEXT,                -- rule | classifier | llm
+            evidence    TEXT,                -- the clause it came from
+            PRIMARY KEY (nct_number, fact_key, fact_value)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tef_key_value
+            ON trial_eligibility_facts (fact_key, fact_value);
+    """),
+
     ("county_boundaries", """
         CREATE TABLE IF NOT EXISTS county_boundaries (
             fipscode    TEXT PRIMARY KEY,
@@ -437,6 +479,13 @@ INDEXES: list[tuple[str, str]] = [
     ("counties", """
         CREATE INDEX IF NOT EXISTS idx_county_boundaries_geom
             ON county_boundaries USING GIST (geom);
+    """),
+
+    ("eligibility", """
+        -- Screening reads these in bulk and filters on them directly.
+        CREATE INDEX IF NOT EXISTS idx_te_sex ON trial_eligibility (sex);
+        CREATE INDEX IF NOT EXISTS idx_te_age ON trial_eligibility (min_age_years, max_age_years);
+        CREATE INDEX IF NOT EXISTS idx_te_healthy ON trial_eligibility (healthy_volunteers);
     """),
 
     ("chat", """

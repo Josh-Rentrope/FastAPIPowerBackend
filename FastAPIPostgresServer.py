@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import List, Optional, Union
 
 import uvicorn
@@ -396,12 +397,31 @@ def build_filters(q, status, phase):
     return clauses, params
 
 
-def eligibility_filters(age, sex, healthy_volunteer, facts):
+def _normalise_facts(facts):
+    """Accept both shapes this project uses for answers.
+
+    HTTP query parameters arrive as ["prior_therapy:chemotherapy:yes"]; the chat
+    tool receives {"prior_therapy:chemotherapy": true}. Normalising here keeps the
+    two paths from quietly disagreeing about what the same answer means.
+    """
+    if isinstance(facts, dict):
+        return [f"{k}:{'yes' if v else 'no'}" for k, v in facts.items()]
+    return list(facts or [])
+
+
+def eligibility_filters(age, sex, healthy_volunteer, facts,
+                        age_min=None, age_max=None):
     """Predicates over `trial_eligibility` and its extracted facts.
 
     Kept separate from `build_filters` because these need a join the text filters
     do not, and because they are only applied where a person's own answers are
     known -- a plain browse should not silently exclude studies.
+
+    `age` is an exact age; `age_min`/`age_max` are a band. A band cannot say
+    whether a particular age qualifies, so the filter keeps studies whose range
+    *overlaps* the band and the fit verdict reports the boundary as uncertain.
+    Dropping a study because one end of the band misses would be wrong; keeping it
+    while claiming it is a match would also be wrong.
 
     `facts` entries are "key:value:yes|no". A "yes" removes studies that EXCLUDE
     the attribute; a "no" removes studies that REQUIRE it. Silence never excludes,
@@ -415,6 +435,15 @@ def eligibility_filters(age, sex, healthy_volunteer, facts):
         clauses.append("(te.min_age_years IS NULL OR te.min_age_years <= :age)")
         clauses.append("(te.max_age_years IS NULL OR te.max_age_years >= :age)")
         params["age"] = age
+    else:
+        if isinstance(age_min, int):
+            # A study is possible if its upper bound is at or above the band floor.
+            clauses.append("(te.max_age_years IS NULL OR te.max_age_years >= :age_min)")
+            params["age_min"] = age_min
+        if isinstance(age_max, int):
+            # ...and its lower bound is at or below the band ceiling.
+            clauses.append("(te.min_age_years IS NULL OR te.min_age_years <= :age_max)")
+            params["age_max"] = age_max
 
     if sex:
         s = str(sex).upper()
@@ -431,7 +460,7 @@ def eligibility_filters(age, sex, healthy_volunteer, facts):
     elif healthy_volunteer is False:
         clauses.append("coalesce(te.healthy_volunteers, false) = false")
 
-    for i, raw in enumerate(facts or []):
+    for i, raw in enumerate(_normalise_facts(facts)):
         bits = str(raw).split(":", 2)
         if len(bits) != 3:
             continue
@@ -457,7 +486,8 @@ def _fact_label(key: str, value: str) -> str:
 
 
 def _fit_for_studies(db, studies: dict[str, dict], age, sex,
-                     healthy_volunteer, facts) -> dict[str, dict]:
+                     healthy_volunteer, facts,
+                     age_min=None, age_max=None) -> dict[str, dict]:
     """Per-study fit, from the answers the caller actually gave.
 
     One extra query for the whole page rather than one per study. The verdict is
@@ -465,13 +495,14 @@ def _fit_for_studies(db, studies: dict[str, dict], age, sex,
     criterion the registry states", never "you are eligible" -- the registry does
     not contain enough information to say that, and the study team does.
     """
-    has_answers = (isinstance(age, int) or bool(sex)
+    has_answers = (isinstance(age, int) or isinstance(age_min, int)
+                   or isinstance(age_max, int) or bool(sex)
                    or healthy_volunteer is not None or bool(facts))
     if not has_answers or not studies:
         return {}
 
     answered: dict[tuple[str, str], bool] = {}
-    for raw in facts or []:
+    for raw in _normalise_facts(facts):
         bits = str(raw).split(":", 2)
         if len(bits) != 3:
             continue
@@ -496,14 +527,24 @@ def _fit_for_studies(db, studies: dict[str, dict], age, sex,
         reasons: list[str] = []
         unknown = 0
 
+        lo, hi = s.get("min_age_years"), s.get("max_age_years")
         if isinstance(age, int):
-            lo, hi = s.get("min_age_years"), s.get("max_age_years")
             if lo is not None and lo > age:
                 reasons.append(f"Study requires age {lo} or older")
             if hi is not None and hi < age:
                 reasons.append(f"Study is limited to age {hi} or younger")
-        elif s.get("min_age_years") is not None or s.get("max_age_years") is not None:
-            unknown += 1  # age range listed, reader did not give an age
+        elif isinstance(age_min, int) or isinstance(age_max, int):
+            # The band overlaps this study's range (or it would have been
+            # filtered). It only fully passes when the study's range covers the
+            # whole band; a boundary inside the band is genuinely unknown.
+            straddles = (
+                (isinstance(age_min, int) and lo is not None and lo > age_min)
+                or (isinstance(age_max, int) and hi is not None and hi < age_max)
+            )
+            if straddles:
+                unknown += 1
+        elif lo is not None or hi is not None:
+            unknown += 1  # range listed, reader did not give an age
 
         study_sex = (s.get("sex") or "").upper()
         if sex_wanted in ("FEMALE", "MALE"):
@@ -614,6 +655,8 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
                 status: Optional[str] = None, phase: Optional[str] = None,
                 bbox: Optional[str] = None, page: int = 1, limit: int = 10,
                 age: Optional[int] = Query(None, ge=0, le=120),
+                age_min: Optional[int] = Query(None, ge=0, le=120),
+                age_max: Optional[int] = Query(None, ge=0, le=120),
                 sex: Optional[str] = None,
                 healthy_volunteer: Optional[bool] = None,
                 fact: Optional[List[str]] = Query(None)):
@@ -622,7 +665,8 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
     offset = (page - 1) * limit
 
     clauses, params = build_filters(q, status, phase)
-    elig_clauses, elig_params = eligibility_filters(age, sex, healthy_volunteer, fact)
+    elig_clauses, elig_params = eligibility_filters(
+        age, sex, healthy_volunteer, fact, age_min=age_min, age_max=age_max)
     clauses.extend(elig_clauses)
     params.update(elig_params)
     env = parse_bbox(bbox)
@@ -690,7 +734,8 @@ def get_studies(db=Depends(get_db), q: Optional[str] = None,
             })
 
     for nct, fit in _fit_for_studies(
-            db, studies, age, sex, healthy_volunteer, fact).items():
+            db, studies, age, sex, healthy_volunteer, fact,
+            age_min=age_min, age_max=age_max).items():
         studies[nct]["fit"] = fit
 
     ordered = sorted(studies.values(), key=lambda s: ids.index(s["nct_number"]))
@@ -994,25 +1039,49 @@ def get_messages(conv_id: str, request: Request, db=Depends(get_db)):
     return [{k: str(v) for k, v in r.items()} for r in rows]
 
 
-def _search_trials(db, q=None, status=None, phase=None, limit=5):
-    """The model's only tool.
+def _search_trials(db, q=None, status=None, phase=None, limit=5,
+                   age=None, age_min=None, age_max=None, sex=None,
+                   healthy_volunteer=None, facts=None):
+    """The model's only search tool.
 
     Returns rows straight out of the database, so every NCT number in a reply is
     a real record. The model never supplies a trial it was not handed.
+
+    The eligibility arguments are what turn a free-text request ("I'm 54, had
+    chemotherapy, and I'm not healthy") into a real filter rather than the model
+    pretending to reason over rows it cannot see. `fit` is attached so the reply
+    can use the same verdict the UI shows.
     """
     clauses, params = build_filters(q, status, phase)
+    elig_clauses, elig_params = eligibility_filters(
+        age, sex, healthy_volunteer, facts,
+        age_min=age_min, age_max=age_max)
+    clauses.extend(elig_clauses)
+    params.update(elig_params)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     try:
         params["limit"] = max(1, min(int(limit or 5), 25))
     except (TypeError, ValueError):
         params["limit"] = 5
+
     rows = db.execute(text(f"""
-        SELECT nct_number, study_title, status, phase, conditions, sponsor
-        FROM processed_data pd {where}
-        ORDER BY last_updated_date DESC NULLS LAST
+        SELECT pd.nct_number, pd.study_title, pd.status, pd.phase, pd.conditions,
+               pd.sponsor, te.min_age_years, te.max_age_years, te.sex,
+               te.healthy_volunteers
+        FROM processed_data pd
+        LEFT JOIN trial_eligibility te ON te.nct_number = pd.nct_number
+        {where}
+        ORDER BY pd.last_updated_date DESC NULLS LAST
         LIMIT :limit
     """), params).mappings().all()
-    return {"studies": [dict(r) for r in rows]}
+
+    out = [dict(r) for r in rows]
+    studies = {r["nct_number"]: r for r in out}
+    for nct, fit in _fit_for_studies(
+            db, studies, age, sex, healthy_volunteer, facts,
+            age_min=age_min, age_max=age_max).items():
+        studies[nct]["fit"] = fit
+    return {"studies": out}
 
 
 def _list_protocols(db):
@@ -1060,8 +1129,11 @@ TOOL_SCHEMA = [
         "function": {
             "name": "search_clinical_trials",
             "description": "Search the clinical trials database by condition, "
-                           "recruitment status, and phase. Always use this rather "
-                           "than answering from memory.",
+                           "recruitment status, phase, and eligibility. Always use "
+                           "this rather than answering from memory. When the reader "
+                           "adds a constraint in prose, translate it into these "
+                           "eligibility parameters instead of filtering the "
+                           "results yourself.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1070,6 +1142,26 @@ TOOL_SCHEMA = [
                     "phase": {"type": "string",
                               "description": "PHASE1, PHASE2, PHASE3, PHASE4, EARLY_PHASE1"},
                     "limit": {"type": "integer", "description": "Max results, default 5"},
+                    "age": {"type": "integer",
+                            "description": "Exact age, only if the reader gave one"},
+                    "age_min": {"type": "integer",
+                                "description": "Lower bound of an age band"},
+                    "age_max": {"type": "integer",
+                                "description": "Upper bound of an age band; omit for 65+"},
+                    "sex": {"type": "string", "enum": ["female", "male"]},
+                    "healthy_volunteer": {
+                        "type": "boolean",
+                        "description": "true if the reader is healthy; false if "
+                                       "they have a diagnosis being studied",
+                    },
+                    "facts": {
+                        "type": "object",
+                        "description": (
+                            "Eligibility facts the reader confirmed, e.g. "
+                            "{\"prior_therapy:chemotherapy\": true}. Keys come "
+                            "from narrow_trials."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -1150,7 +1242,10 @@ TOOL_SCHEMA = [
 # argument names, and a stray key is a TypeError that would otherwise escape as a
 # 500 -- which a browser reports as a CORS failure.
 TOOL_REGISTRY = {
-    "search_clinical_trials": (_search_trials, {"q", "status", "phase", "limit"}),
+    "search_clinical_trials": (_search_trials, {
+        "q", "status", "phase", "limit", "age", "age_min", "age_max", "sex",
+        "healthy_volunteer", "facts",
+    }),
     "list_qualification_protocols": (_list_protocols, set()),
     "screen_eligibility": (_screen_eligibility, {"criteria_id", "answers"}),
     "narrow_trials": (_narrow_trials, {"condition", "status", "answers"}),
@@ -1163,28 +1258,73 @@ SYSTEM_PROMPT = (
     "1. Never state a fact about trials from memory. Call search_clinical_trials "
     "first, and cite every trial by its NCT number verbatim. If a tool returns "
     "nothing, say so plainly -- a fabricated NCT number is worse than no answer.\n"
-    "2. Collect age, sex and healthy-volunteer status ONCE, together, as a short "
-    "form. Do not drip these out one per turn; they are the same questions every "
-    "form already asks and making someone answer them in chat is tedious.\n"
+    "2. If a READER CONTEXT block is present, those answers are already known: use "
+    "them and do not ask again. Otherwise collect age, sex and healthy-volunteer "
+    "status ONCE, together, as a short form. Do not drip these out one per turn; "
+    "they are the same questions every form already asks.\n"
     "3. Then narrow. Call narrow_trials with the accumulated answers. It returns "
     "the single most informative question, already phrased for a patient, plus "
     "how many trials remain. Ask exactly that question, one per turn, and pass "
     "every answer back next time. Never invent your own question.\n"
     "4. When narrow_trials returns no question, the pool is as small as it gets. "
-    "Call search_clinical_trials and present the shortlist with NCT numbers.\n"
-    "5. If the person names a specific protocol from "
+    "Call search_clinical_trials and present the shortlist with NCT numbers. Each "
+    "result carries a `fit` verdict; use it as screening language, never as a "
+    "determination of eligibility.\n"
+    "5. When the reader adds a constraint in prose ('I'm 54', 'I've had "
+    "immunotherapy', 'phase 2 only', 'I'm healthy'), translate it into the "
+    "matching search_clinical_trials arguments (age/age_min/age_max, sex, "
+    "healthy_volunteer, facts) and search again. Never filter mentally, and never "
+    "name a trial the tool did not return.\n"
+    "6. If the person names a specific protocol from "
     "list_qualification_protocols, switch to screen_eligibility and ask its "
     "`next_questions` the same way.\n\n"
     "BOUNDARIES:\n"
-    "6. You are screening, not deciding. Never say someone is eligible or "
+    "7. You are screening, not deciding. Never say someone is eligible or "
     "ineligible -- say which criteria they appear to meet or not meet, and that "
     "the study team confirms it with tests.\n"
-    "7. If someone declines a question, move on. It is reported as unknown and "
+    "8. If someone declines a question, move on. It is reported as unknown and "
     "never assumed either way.\n"
-    "8. Be conversational and brief. No questionnaires, no walls of text.\n"
-    "9. This is health information, not medical advice. Encourage them to raise "
+    "9. Be conversational and brief. No questionnaires, no walls of text.\n"
+    "10. This is health information, not medical advice. Encourage them to raise "
     "anything concerning with their care team."
 )
+
+
+_SAFE_FACT = re.compile(r"^[a-z_]{1,40}:[a-z0-9_]{1,40}$")
+
+
+def _clean_relevance(rel) -> dict | None:
+    """Validate the reader's answers before they enter the system prompt.
+
+    This block is built from a request body, so it must not become a place to
+    inject instructions. Only known keys, with the expected types, survive; fact
+    keys must match the shape the segmenter produces. Free text (a condition
+    string) is deliberately dropped -- the model already receives the reader's
+    message, and putting arbitrary text in the system prompt is the injection
+    surface this function exists to avoid.
+    """
+    if not isinstance(rel, dict):
+        return None
+    out: dict = {}
+    if isinstance(rel.get("age"), int):
+        out["age"] = rel["age"]
+    for key in ("age_min", "age_max"):
+        if isinstance(rel.get(key), int):
+            out[key] = rel[key]
+    if rel.get("sex") in ("female", "male"):
+        out["sex"] = rel["sex"]
+    if isinstance(rel.get("healthy_volunteer"), bool):
+        out["healthy_volunteer"] = rel["healthy_volunteer"]
+    facts = rel.get("facts")
+    if isinstance(facts, dict):
+        clean_facts = {
+            k: v
+            for k, v in list(facts.items())[:20]
+            if isinstance(v, bool) and isinstance(k, str) and _SAFE_FACT.match(k)
+        }
+        if clean_facts:
+            out["facts"] = clean_facts
+    return out or None
 
 
 @chat_router.post("/conversations/{conv_id}/messages", response_model=Message, status_code=201)
@@ -1215,7 +1355,22 @@ def post_message(conv_id: str, body: dict, request: Request, db=Depends(get_db))
         WHERE conversation_id = :c ORDER BY sent_at DESC, id DESC LIMIT 10
     """), {"c": conv_id}).mappings().all()
 
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Relevance answers travel with every message. They are what lets the model
+    # filter rather than guess: the alternative (asking the reader the same
+    # questions again, or deciding from memory which rows qualify) is either
+    # tedious or wrong.
+    relevance = _clean_relevance((body or {}).get("relevance"))
+    context = ""
+    if relevance:
+        context = (
+            "\n\nREADER CONTEXT -- answers already given in the relevance "
+            "questionnaire. Do not ask for them again, and pass them into every "
+            "search:\n" + json.dumps(relevance, default=str) +
+            "\nWhen the reader adds a constraint in prose, translate it into the "
+            "matching search_clinical_trials parameters and search again."
+        )
+
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT + context}]
     for h in reversed(history):
         msgs.append({
             "role": "user" if h["sender_id"] == session["id"] else "assistant",

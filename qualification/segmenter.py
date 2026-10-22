@@ -47,7 +47,19 @@ FORM_FIELDS = ("age", "sex", "healthy_volunteer")
 
 # A fact must appear on at least this share of candidates to be worth asking.
 # Below it, the question cannot move the needle.
-MIN_SUPPORT = 0.02
+MIN_SUPPORT = 0.05
+
+# A question must actually teach something. Entropy is bounded by log2(3) ~= 1.58
+# for a three-way split; 0.5 bits is roughly "no bucket above 80%".
+MIN_GAIN = 0.5
+
+# Once the pool is this small, stop. At this size the shortlist is readable, and
+# another question costs the reader more attention than it saves.
+STOP_AT = 40
+
+# A hard ceiling on fact questions. Entropy will happily keep splitting a large
+# pool, but attention is the scarce resource, not the search space.
+MAX_QUESTIONS = 8
 
 # Facts phrased in a way a person can actually answer. Anything not listed is
 # still scored, but questions are generated from this mapping so the assistant
@@ -73,6 +85,31 @@ QUESTION_TEXT = {
     ("transplant", "transplant"): "Have you had an organ or stem-cell transplant?",
     ("cns", "metastases"): "Do you have metastases in the brain or spine?",
     ("other_malignancy", "recent"): "Have you had another cancer in the last few years?",
+    # Condition-specific facts that were in the data but unphrased, so the
+    # segmenter could score them and never ask them. These are what make the
+    # questions feel like they are about this reader's disease.
+    ("performance_status", "ecog"):
+        "Do you know your ECOG performance status? It runs from 0 (fully active) "
+        "to 4 (fully disabled).",
+    ("prognosis", "life_expectancy"):
+        "Has your care team estimated how long your disease might stay stable?",
+    ("organ_function", "required"):
+        "Do you know whether your liver and kidney function meet standard trial "
+        "requirements?",
+    ("prior_therapy", "surgery"): "Have you had surgery for this condition?",
+    ("vaccine", "live"): "Have you had a live vaccine in the last few weeks?",
+    ("biomarker", "egfr_mutation"):
+        "Do you know whether your tumour has an EGFR mutation?",
+    ("biomarker", "alk"):
+        "Do you know whether your tumour has an ALK rearrangement?",
+    ("biomarker", "braf"):
+        "Do you know whether your tumour has a BRAF mutation?",
+    ("biomarker", "kras"):
+        "Do you know whether your tumour has a KRAS mutation?",
+    ("biomarker", "ros1"):
+        "Do you know whether your tumour has a ROS1 fusion?",
+    ("biomarker", "tmb"):
+        "Do you know your tumour mutational burden (TMB)?",
 }
 
 
@@ -93,11 +130,22 @@ COST = {
     "biomarker": 1.8,      # most patients do not know their marker status
     "other_malignancy": 1.4,
     "transplant": 1.3,
+    "performance_status": 1.6,
+    "prognosis": 1.8,
+    "organ_function": 2.4,  # a blood test, not something a patient is usually told
+    "vaccine": 1.3,
 }
 
 
 def applicable(fact_key: str, fact_value: str, answers: dict) -> bool:
     """Whether this question can meaningfully be asked given the answers so far."""
+    # A healthy volunteer has no tumour to characterise. Asking about BRAF or
+    # ECOG would be nonsense, however well it splits the pool.
+    if (answers.get("healthy_volunteer") is True
+            and fact_key in ("biomarker", "performance_status", "prognosis",
+                             "cns", "other_malignancy", "transplant")):
+        return False
+
     if fact_key == "pregnancy":
         sex = (answers.get("sex") or "").lower()
         if sex != "female":
@@ -105,8 +153,14 @@ def applicable(fact_key: str, fact_value: str, answers: dict) -> bool:
             # simply not applicable.
             return False
         age = answers.get("age")
-        if isinstance(age, int) and age >= 55:
-            return False
+        if isinstance(age, int):
+            if age >= 55:
+                return False
+        else:
+            # With a band, only skip when the whole band is past the cutoff.
+            age_min = answers.get("age_min")
+            if isinstance(age_min, int) and age_min >= 55:
+                return False
     if fact_key == "prior_therapy" and fact_value == "checkpoint_inhibitor":
         # Only worth asking someone who has had some systemic therapy.
         facts = answers.get("facts") or {}
@@ -155,6 +209,17 @@ def _where(condition: str | None, status: str | None, answers: dict) -> tuple[st
         clauses.append("(te.min_age_years IS NULL OR te.min_age_years <= %(age)s)")
         clauses.append("(te.max_age_years IS NULL OR te.max_age_years >= %(age)s)")
         params["age"] = age
+    else:
+        # Same overlap rule as /studies, so the count shown while asking is the
+        # count the list will show after applying.
+        age_min = answers.get("age_min")
+        age_max = answers.get("age_max")
+        if isinstance(age_min, int):
+            clauses.append("(te.max_age_years IS NULL OR te.max_age_years >= %(age_min)s)")
+            params["age_min"] = age_min
+        if isinstance(age_max, int):
+            clauses.append("(te.min_age_years IS NULL OR te.min_age_years <= %(age_max)s)")
+            params["age_max"] = age_max
 
     sex = (answers.get("sex") or "").upper()
     if sex in ("FEMALE", "MALE"):
@@ -197,26 +262,22 @@ def next_question(cur, condition: str | None, status: str | None,
 
     # Apply facts already answered: a trial that requires a fact the user lacks,
     # or excludes a fact the user has, drops out.
-    for fk, fv, has_it in _answered_fact_filter(answers):
-        if has_it:
-            # Keep trials that either require it or are silent; drop excluders.
-            where += """
-                AND NOT EXISTS (
-                    SELECT 1 FROM trial_eligibility_facts f
-                    WHERE f.nct_number = te.nct_number
-                      AND f.fact_key = %(fk)s AND f.fact_value = %(fv)s
-                      AND f.polarity = 'exclude')
-            """
-        else:
-            where += """
-                AND NOT EXISTS (
-                    SELECT 1 FROM trial_eligibility_facts f
-                    WHERE f.nct_number = te.nct_number
-                      AND f.fact_key = %(fk)s AND f.fact_value = %(fv)s
-                      AND f.polarity = 'require')
-            """
-        params[f"fk"] = fk
-        params[f"fv"] = fv
+    #
+    # Each fact needs its OWN parameter names. Reusing `fk`/`fv` meant the second
+    # answer overwrote the first, so the pool grew after an answer and the same
+    # question came back -- a loop the UI could only hide.
+    answered = _answered_fact_filter(answers)
+    for i, (fk, fv, has_it) in enumerate(answered):
+        polarity = "exclude" if has_it else "require"
+        where += f"""
+            AND NOT EXISTS (
+                SELECT 1 FROM trial_eligibility_facts f
+                WHERE f.nct_number = te.nct_number
+                  AND f.fact_key = %(fk{i})s AND f.fact_value = %(fv{i})s
+                  AND f.polarity = '{polarity}')
+        """
+        params[f"fk{i}"] = fk
+        params[f"fv{i}"] = fv
 
     cur.execute(f"""
         SELECT count(*) FROM (
@@ -231,6 +292,16 @@ def next_question(cur, condition: str | None, status: str | None,
     if total == 0:
         return {"total": 0, "next_question": None,
                 "message": "No studies match those filters yet."}
+    if total <= STOP_AT:
+        return {"total": total, "next_question": None,
+                "message": (f"Only {total:,} studies remain. That is already a "
+                            "readable shortlist, and another question would cost "
+                            "more attention than it saves.")}
+    if len(answered) >= MAX_QUESTIONS:
+        return {"total": total, "next_question": None,
+                "message": (f"You have answered {len(answered)} questions and "
+                            f"{total:,} studies remain. Here is the shortlist; "
+                            "answering more would give diminishing returns.")}
 
     # Count, within the surviving pool, how each candidate fact partitions it.
     cur.execute(f"""
@@ -257,8 +328,15 @@ def next_question(cur, condition: str | None, status: str | None,
     """, {**params, "min_support_rows": max(5, int(total * MIN_SUPPORT))})
     rows = cur.fetchall()
 
+    # Never ask something already answered, whatever the counts say. The SQL
+    # filter above should have removed it; this is the guard that keeps a future
+    # change to that filter from turning the conversation into a loop.
+    answered_keys = {f"{fk}:{fv}" for fk, fv, _ in answered}
+
     best = None
     for fact_key, fact_value, requires, excludes in rows:
+        if f"{fact_key}:{fact_value}" in answered_keys:
+            continue
         requires = int(requires or 0)
         excludes = int(excludes or 0)
         silent = max(0, total - requires - excludes)
@@ -278,6 +356,8 @@ def next_question(cur, condition: str | None, status: str | None,
             continue
 
         gain = entropy(parts)
+        if gain < MIN_GAIN:
+            continue
         question = QUESTION_TEXT.get((fact_key, fact_value))
         # Unmapped facts are still scored (they show how much is learnable) but
         # are never surfaced as a question, because we cannot phrase them.

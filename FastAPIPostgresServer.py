@@ -1107,7 +1107,7 @@ def _screen_eligibility(db, criteria_id=None, answers=None):
     return qualification.load_matcher().evaluate(c, answers).as_dict()
 
 
-def _narrow_trials(db, condition=None, status=None, answers=None):
+def _narrow_trials(db, condition=None, status=None, answers=None, phase=None):
     """Pick the next question that best splits the remaining trials.
 
     Pure arithmetic over the candidate pool (entropy of the partition), not a
@@ -1118,7 +1118,7 @@ def _narrow_trials(db, condition=None, status=None, answers=None):
     try:
         cur = conn.cursor()
         return qualification.segmenter.next_question(
-            cur, condition, status, answers or {})
+            cur, condition, status, answers or {}, phase=phase)
     finally:
         conn.close()
 
@@ -1222,6 +1222,8 @@ TOOL_SCHEMA = [
                 "properties": {
                     "condition": {"type": "string", "description": "e.g. 'melanoma'"},
                     "status": {"type": "string", "enum": sorted(KNOWN_STATUSES)},
+                    "phase": {"type": "string",
+                              "description": "PHASE1, PHASE2, PHASE3, PHASE4, EARLY_PHASE1"},
                     "answers": {
                         "type": "object",
                         "description": (
@@ -1248,7 +1250,7 @@ TOOL_REGISTRY = {
     }),
     "list_qualification_protocols": (_list_protocols, set()),
     "screen_eligibility": (_screen_eligibility, {"criteria_id", "answers"}),
-    "narrow_trials": (_narrow_trials, {"condition", "status", "answers"}),
+    "narrow_trials": (_narrow_trials, {"condition", "status", "phase", "answers"}),
 }
 
 SYSTEM_PROMPT = (

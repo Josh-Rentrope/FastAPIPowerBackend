@@ -181,7 +181,8 @@ def entropy(counts: Iterable[int]) -> float:
     return h
 
 
-def _where(condition: str | None, status: str | None, answers: dict) -> tuple[str, dict]:
+def _where(condition: str | None, status: str | None, answers: dict,
+           phase: str | None = None) -> tuple[str, dict]:
     """Candidate filter: filters first, structured fields, then answered facts."""
     # No eligibility gate here. The pool is LEFT-joined, so a study the registry
     # has no eligibility rows for still counts -- exactly as it does in /studies.
@@ -203,6 +204,18 @@ def _where(condition: str | None, status: str | None, answers: dict) -> tuple[st
         if wanted:
             clauses.append("pd.status = ANY(%(status)s)")
             params["status"] = wanted
+    if phase:
+        # Same token-membership rule as /studies: EARLY_PHASE1 is not PHASE1.
+        wanted = [x.strip().upper().replace(" ", "").replace("_", "")
+                  for x in phase.split(",") if x.strip()]
+        if wanted:
+            clauses.append("""
+                EXISTS (
+                    SELECT 1 FROM unnest(string_to_array(pd.phase, '|')) AS ph
+                    WHERE upper(replace(replace(ph, ' ', ''), '_', '')) = ANY(%(phases)s)
+                )
+            """)
+            params["phases"] = wanted
 
     age = answers.get("age")
     if isinstance(age, int):
@@ -256,9 +269,9 @@ def _answered_fact_filter(answers: dict) -> list[tuple[str, str, bool]]:
 
 
 def next_question(cur, condition: str | None, status: str | None,
-                  answers: dict) -> dict:
+                  answers: dict, phase: str | None = None) -> dict:
     """Return the highest-gain question, with the counts that justify it."""
-    where, params = _where(condition, status, answers)
+    where, params = _where(condition, status, answers, phase)
 
     # Apply facts already answered: a trial that requires a fact the user lacks,
     # or excludes a fact the user has, drops out.

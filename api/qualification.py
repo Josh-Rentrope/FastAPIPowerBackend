@@ -26,6 +26,7 @@ class ScreeningRequest(BaseModel):
 class SegmentRequest(BaseModel):
     condition: str | None = None
     status: str | None = None
+    phase: str | None = None
     answers: dict[str, Any] = {}
 
 
@@ -35,13 +36,14 @@ class SegmentRequest(BaseModel):
 # declaration order, so "segment" would otherwise be read as a criteria id and
 # 404 at the lookup instead of reaching this handler.
 
-def _segment(request: Request, condition, status, answers):
+def _segment(request: Request, condition, status, phase, answers):
     if not getattr(request.app.state, "engine", None):
         raise HTTPException(503, "database not configured")
     conn = request.app.state.engine.raw_connection()
     try:
         cur = conn.cursor()
-        return segmenter.next_question(cur, condition, status, answers or {})
+        return segmenter.next_question(
+            cur, condition, status, answers or {}, phase=phase)
     finally:
         conn.close()
 
@@ -49,20 +51,21 @@ def _segment(request: Request, condition, status, answers):
 @router.get("/segment")
 def segment_get(request: Request,
                 condition: str | None = Query(None),
-                status: str | None = Query(None)):
+                status: str | None = Query(None),
+                phase: str | None = Query(None)):
     """Next question for a plain filter-only pool (no answers yet)."""
-    return _segment(request, condition, status, {})
+    return _segment(request, condition, status, phase, {})
 
 
 @router.post("/segment")
 def segment_post(body: SegmentRequest, request: Request):
     """Next question given everything answered so far.
 
-    `answers` carries `age`, `sex`, `healthy_volunteer` (the form fields) and
-    `facts`, keyed `"prior_therapy:chemotherapy": true`. Stateless, like the
-    screening endpoint, so the caller owns the conversation.
+    `answers` carries `age_min`/`age_max`, `sex`, `healthy_volunteer` (the form
+    fields) and `facts`, keyed `"prior_therapy:chemotherapy": true`. Stateless,
+    like the screening endpoint, so the caller owns the conversation.
     """
-    return _segment(request, body.condition, body.status, body.answers)
+    return _segment(request, body.condition, body.status, body.phase, body.answers)
 
 
 @router.get("/criteria")

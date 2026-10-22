@@ -1561,7 +1561,9 @@ SYSTEM_PROMPT = (
     "HOW TO WORK, IN ORDER:\n"
     "1. Never state a fact about trials from memory. Call search_clinical_trials "
     "first, and cite every trial by its NCT number verbatim. If a tool returns "
-    "nothing, say so plainly -- a fabricated NCT number is worse than no answer.\n"
+    "nothing, say so plainly -- a fabricated NCT number is worse than no answer. "
+    "Use the tool interface; never print tool names, JSON arguments, or DSML "
+    "markup in your reply.\n"
     "2. If a READER CONTEXT block is present, those answers are already known: use "
     "them and do not ask again. Otherwise collect age, sex and healthy-volunteer "
     "status ONCE, together, as a short form. Do not drip these out one per turn; "
@@ -1718,11 +1720,75 @@ def post_message(conv_id: str, body: dict, request: Request, db=Depends(get_db))
     return {k: str(v) for k, v in row.items()}
 
 
-def _run_llm(db, msgs: list[dict]) -> str:
-    """One tool round-trip, then a final answer.
+# Some OpenAI-compatible endpoints (notably DeepSeek) return a tool call as DSML
+# markup inside `content` instead of structured `tool_calls`. The marker is
+# `<｜｜DSML｜｜`; the variants below cover the common spellings. Without this
+# parser the raw markup was returned to the reader as the assistant's answer.
+_DSML_CORES = ("｜｜DSML｜｜", "|｜DSML｜｜")
+_DSML_CORE = "(?:" + "|".join(re.escape(m) for m in _DSML_CORES) + ")"
+_DSML_INVOKE = re.compile(
+    "<" + _DSML_CORE + r"\s*invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)</"
+    + _DSML_CORE + r"\s*invoke>",
+    re.S,
+)
+_DSML_PARAM = re.compile(
+    "<" + _DSML_CORE
+    + r"\s*parameter\s+name=\"([^\"]+)\"(?:\s+string=\"(true|false)\")?[^>]*>(.*?)</"
+    + _DSML_CORE + r"\s*parameter>",
+    re.S,
+)
 
-    Degrades to an explanation rather than a 500 when the model is unreachable,
-    because a chat failure should not look like a platform outage.
+
+def _parse_dsml_calls(content: str) -> list[tuple[str, dict]]:
+    """Extract (name, arguments) from text-form tool calls, or [] if none."""
+    if not content or "DSML" not in content:
+        return []
+    calls: list[tuple[str, dict]] = []
+    for name, body in _DSML_INVOKE.findall(content):
+        args: dict = {}
+        for pname, is_string, pvalue in _DSML_PARAM.findall(body):
+            raw = pvalue.strip()
+            if is_string == "true":
+                args[pname] = raw
+            else:
+                try:
+                    args[pname] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    args[pname] = raw
+        calls.append((name.strip(), args))
+    return calls
+
+
+def _strip_dsml(text: str) -> str:
+    """Remove tool markup from prose. Anything before the first marker survives."""
+    if not text or "DSML" not in text:
+        return text
+    return re.sub("<" + _DSML_CORE + r".*", "", text, flags=re.S).strip()
+
+
+def _execute_tool(db, name, raw_args, fn, allowed):
+    """Run one tool, filtered to its declared arguments.
+
+    The model chooses the argument names, so a stray key is filtered rather than
+    raising a TypeError that would escape as a 500 (which a browser reports as a
+    CORS error). A failed tool becomes a result the model can explain.
+    """
+    if fn is None:
+        return {"error": f"unknown tool {name!r}", "available": sorted(TOOL_REGISTRY)}
+    args = {k: v for k, v in raw_args.items() if k in allowed}
+    try:
+        return fn(db, **args)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        return {"error": f"{name} failed: {type(exc).__name__}"}
+
+
+def _run_llm(db, msgs: list[dict]) -> str:
+    """Run the model with tools until it answers.
+
+    Handles both tool-call styles: structured `tool_calls` and DeepSeek's DSML
+    text form. Degrades to an explanation rather than a 500 when the model is
+    unreachable, because a chat failure should not look like a platform outage.
     """
     if not LLM_API_KEY:
         return ("Chat is not configured on this deployment (no model API key). "
@@ -1736,62 +1802,68 @@ def _run_llm(db, msgs: list[dict]) -> str:
     client = (OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL) if LLM_BASE_URL
               else OpenAI(api_key=LLM_API_KEY))
 
-    try:
-        first = client.chat.completions.create(
-            model=CHAT_MODEL, messages=msgs, tools=TOOL_SCHEMA, tool_choice="auto")
-    except Exception as exc:  # noqa: BLE001
-        return f"The model is unreachable right now ({type(exc).__name__})."
-
-    # An empty `choices` list is legal in some OpenAI-compatible implementations
-    # and would be an IndexError otherwise.
-    if not getattr(first, "choices", None):
-        return "The model returned no answer."
-
-    choice = first.choices[0].message
-    calls = getattr(choice, "tool_calls", None)
-    if not calls:
-        return choice.content or "No answer was produced."
-
-    msgs.append(choice)
-
-    for call in calls:
-        name = call.function.name
-        # The model chooses the argument names, so they are filtered against the
-        # function's real signature. A stray key would be a TypeError, which used
-        # to escape as a 500 -- and a 500 without CORS headers reads, in a
-        # browser, as a CORS failure.
-        fn, allowed = TOOL_REGISTRY.get(name, (None, set()))
-
+    last_content = ""
+    for _round in range(3):
         try:
-            raw_args = json.loads(call.function.arguments or "{}")
-        except (json.JSONDecodeError, TypeError):
-            raw_args = {}
-        if not isinstance(raw_args, dict):
-            raw_args = {}
+            response = client.chat.completions.create(
+                model=CHAT_MODEL, messages=msgs, tools=TOOL_SCHEMA,
+                tool_choice="auto")
+        except Exception as exc:  # noqa: BLE001
+            return f"The model is unreachable right now ({type(exc).__name__})."
 
-        if fn is None:
-            result = {"error": f"unknown tool {name!r}",
-                      "available": sorted(TOOL_REGISTRY)}
-        else:
-            args = {k: v for k, v in raw_args.items() if k in allowed}
-            try:
-                result = fn(db, **args)
-            except Exception as exc:  # noqa: BLE001
-                # A failed tool should become a result the model can explain, not
-                # an exception that takes down the request.
-                db.rollback()
-                result = {"error": f"{name} failed: {type(exc).__name__}"}
-
-        msgs.append({"role": "tool", "tool_call_id": call.id,
-                     "name": name, "content": json.dumps(result, default=str)})
-
-    try:
-        second = client.chat.completions.create(model=CHAT_MODEL, messages=msgs)
-        if not getattr(second, "choices", None):
+        # An empty `choices` list is legal in some OpenAI-compatible
+        # implementations and would be an IndexError otherwise.
+        if not getattr(response, "choices", None):
             return "The model returned no answer."
-        return second.choices[0].message.content or "No answer was produced."
-    except Exception as exc:  # noqa: BLE001
-        return f"The model is unreachable right now ({type(exc).__name__})."
+
+        choice = response.choices[0].message
+        content = choice.content or ""
+        last_content = content
+
+        native_calls = getattr(choice, "tool_calls", None)
+        if native_calls:
+            msgs.append(choice)
+            for call in native_calls:
+                name = call.function.name
+                fn, allowed = TOOL_REGISTRY.get(name, (None, set()))
+                try:
+                    raw_args = json.loads(call.function.arguments or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    raw_args = {}
+                if not isinstance(raw_args, dict):
+                    raw_args = {}
+                result = _execute_tool(db, name, raw_args, fn, allowed)
+                msgs.append({"role": "tool", "tool_call_id": call.id,
+                             "name": name,
+                             "content": json.dumps(result, default=str)})
+            continue
+
+        dsml_calls = _parse_dsml_calls(content)
+        if dsml_calls:
+            # Drop the markup from the history so the model does not learn to
+            # repeat it; the results are delivered in a normal user message.
+            msgs.append({"role": "assistant",
+                         "content": _strip_dsml(content) or "I'll look that up."})
+            results = []
+            for name, raw_args in dsml_calls:
+                fn, allowed = TOOL_REGISTRY.get(name, (None, set()))
+                result = _execute_tool(db, name, raw_args, fn, allowed)
+                results.append({"name": name, "arguments": raw_args,
+                                "result": result})
+            msgs.append({
+                "role": "user",
+                "content": (
+                    "TOOL RESULTS (JSON):\n"
+                    + json.dumps(results, default=str)
+                    + "\nAnswer the reader using these results. Do not emit tool "
+                      "markup or DSML; reply in prose."
+                ),
+            })
+            continue
+
+        return _strip_dsml(content) or "No answer was produced."
+
+    return _strip_dsml(last_content) or "The assistant could not finish that request."
 
 
 # ── routers ─────────────────────────────────────────────────────────────────
